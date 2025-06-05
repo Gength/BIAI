@@ -1,0 +1,19 @@
+Dataset:
+memory efficiency: now use pd.DataFrame instead of list, use pd.Categorical to compress memory, too slow
+coming->convert data into stream input (pkl->json, LazySupervisedDataset)
+Optimize random_word, make it parallel
+
+tokenizer:
+BUG: if [PAD] is inserted into a sequence, it will be tokenized into '[', 'PAD' ,']'
+avoid conflict between mov [eax + 4], ebx, use <>
+• Replacing all the constant values by <const>., using a regular expression| binary nomalization
+• Replacing all internal functions with <ICall>.
+• Replacing all the destinations of local jump with <JumpAddress>.
+
+bert:
+extend decoder layers of bert
+
+where is disassembly function?
+how to get cfg in matrix form?
+now just instruction pairs, maybe instruction block? introduce structural information
+any other dataset?
