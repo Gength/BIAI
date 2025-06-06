@@ -11,6 +11,10 @@ import gc
 from models.dataset import BERTDataset
 from models.bert import BERT
 from models.tokenizer import AsmTokenizer
+import numpy as np
+from datasets import load_dataset
+import json
+from models.collatefn import CollateFn
 
 class BERTTrainer:
 	def __init__(
@@ -38,7 +42,7 @@ class BERTTrainer:
 		self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
     		self.optim,
     		max_lr=1e-3,
-    		steps_per_epoch=len(train_dataloader),
+    		steps_per_epoch=train_dataloader.dataset._info.dataset_size // train_dataloader.batch_size,
     		epochs=num_epochs,
     		pct_start=0.1,
     		anneal_strategy='cos',
@@ -69,7 +73,7 @@ class BERTTrainer:
 		data_iter = tqdm.tqdm(
 			enumerate(data_loader),
 			desc="EP_%s:%d" % (mode, epoch),
-			total=len(data_loader),
+			total=data_loader.dataset._info.dataset_size // data_loader.batch_size,
 			bar_format="{l_bar}{r_bar}"
 		)
 
@@ -124,37 +128,52 @@ if __name__=="__main__":
 	parser = argparse.ArgumentParser(description="Command line parameters")
 	parser.add_argument('--device', default="cuda", dest="device")
 	args = parser.parse_args()
-	MAX_LEN = 64
-	# dtype = f'U{MAX_LEN}'
+	seq_len = 16
 	data_dir = "."
 
-	binary = os.path.join(data_dir, "outputs", f"baseline-train.pkl")
-	with open(binary, 'rb') as c:
-		train_data = pickle.load(c)
-	# results_string = []
-	# for i in data:
-	# 	results_string.extend(list(i))
-    
 	tokenizer = AsmTokenizer(vocab_file=os.path.join(data_dir, "outputs", f"baseline-vocab.txt"))
 	print(f"Vocab size: {len(tokenizer.vocab)}")
 
-	train_data = load_assembly_data(train_data)
-	train_data = pd.DataFrame(train_data)
-	train_data[0] = pd.Categorical(train_data[0])
-	train_data[1] = pd.Categorical(train_data[1])
-	binary = os.path.join(data_dir, "outputs", f"baseline-valid.pkl")
-	with open(binary, 'rb') as c:
-		valid_data = pickle.load(c)
+	train_dataset_path = os.path.join(data_dir, "outputs", f"baseline-train.jsonl")
+	train_metadata_path = os.path.join(data_dir, "outputs", f"baseline-train-metadata.jsonl")
+	train_dataset = load_dataset('json', data_files=train_dataset_path, split='train', streaming=True)
+	with open(train_metadata_path, "r", encoding="utf-8") as f:
+		metadata = json.load(f)
+		dataset_size = metadata['__metadata__']['dataset_size']
+		print(f"Train Dataset size: {dataset_size}")
+		train_dataset.info.dataset_size = dataset_size
+	shuffled_train_dataset = train_dataset.shuffle(seed=42, buffer_size=5000)
 
-	valid_data = load_assembly_data(valid_data)
-	valid_data = pd.DataFrame(valid_data)
-	valid_data[0] = pd.Categorical(valid_data[0])
-	valid_data[1] = pd.Categorical(valid_data[1])
+	valid_dataset_path = os.path.join(data_dir, "outputs", f"baseline-valid.jsonl")
+	valid_metadata_path = os.path.join(data_dir, "outputs", f"baseline-valid-metadata.jsonl")
+	valid_dataset = load_dataset('json', data_files=valid_dataset_path, split='train', streaming=True)
+	with open(valid_metadata_path, "r", encoding="utf-8") as f:
+		metadata = json.load(f)
+		dataset_size = metadata['__metadata__']['dataset_size']
+		print(f"Validation Dataset size: {dataset_size}")
+		valid_dataset.info.dataset_size = dataset_size
+	shuffled_valid_dataset = valid_dataset.shuffle(seed=42, buffer_size=5000)
 
-	train_dataset = BERTDataset(train_data, tokenizer, seq_len=16, device=args.device)
-	valid_dataset = BERTDataset(valid_data, tokenizer, seq_len=16, device=args.device)
-	train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True)# num_workers=2, prefetch_factor=1
-	valid_loader = DataLoader(valid_dataset, batch_size=1024, shuffle=True)
+	train_loader = DataLoader(
+		shuffled_train_dataset, 
+		batch_size=512, 
+		num_workers=12,
+		prefetch_factor=4,
+		persistent_workers=True,
+		pin_memory=True,  # 添加内存固定
+		collate_fn=CollateFn(tokenizer, seq_len=seq_len, train=True)
+
+		)
+	valid_loader = DataLoader(
+		shuffled_valid_dataset, 
+		batch_size=512, 
+		num_workers=12,
+		prefetch_factor=4,
+		persistent_workers=True,
+		pin_memory=True,  # 添加内存固定
+		collate_fn=CollateFn(tokenizer, seq_len=seq_len, train=True)
+		)
+	
 	bert_model = BERT(
 	  vocab_size=len(tokenizer.vocab),
 	  d_model=128,
