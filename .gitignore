@@ -2,3 +2,4 @@ outputs/
 __pycache__/
 Dataset-1/
 baseline-results-L1.csv
+extract_strip_function_name_and_address_and_assembly_code_and_cfg_and_psuedo_code_idapython.py

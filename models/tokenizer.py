@@ -44,22 +44,23 @@ class AsmTokenizer:
 	def tokenize(self, text):
 
 		# Custom regex-based tokenization for assembly
-		# tokens = re.findall(r"[\w]+|[\[\],:;*+./-]", text)
-		tokens = re.findall(
-            r"<[A-Z]+>|"        # Match special tokens like <PAD>
-            r"0x[0-9a-fA-F]+|"   # Hexadecimal numbers
-            r"\b\d+\b|"          # Decimal integers (word boundaries prevent partial matches)
-            r"[\w']+|"           # Identifiers (allows apostrophes for MMX registers)
-            r"[!@#$%^&*()_+={}\[\]:;|<>,.?/~`-]"  # Special symbols
-			, text)
-		processed_tokens = []
-		for token in tokens:
-            # Check if it is a hexadecimal or decimal constant
-			if re.match(r"0x[0-9a-fA-F]+", token) or re.match(r"[-+]?\b\d+\b", token):
-				processed_tokens.append("<const>")
-			else:
-				processed_tokens.append(token)
-		return processed_tokens
+		tokens = re.findall(r"<[A-Z]+>|[\w]+|[\[\],:;*+./-]", text)
+		return tokens
+		# tokens = re.findall(
+        #     r"<[A-Z]+>|"        # Match special tokens like <PAD>
+        #     r"0x[0-9a-fA-F]+|"   # Hexadecimal numbers
+        #     r"\b\d+\b|"          # Decimal integers (word boundaries prevent partial matches)
+        #     r"[\w']+|"           # Identifiers (allows apostrophes for MMX registers)
+        #     r"[!@#$%^&*()_+={}\[\]:;|<>,.?/~`-]"  # Special symbols
+		# 	, text)
+		# processed_tokens = []
+		# for token in tokens:
+        #     # Check if it is a hexadecimal or decimal constant
+		# 	if re.match(r"0x[0-9a-fA-F]+", token) or re.match(r"[-+]?\b\d+\b", token):
+		# 		processed_tokens.append("<const>")
+		# 	else:
+		# 		processed_tokens.append(token)
+		# return processed_tokens
 	
 	def encode(self, text):
 		tokens = self.tokenize(text)
