@@ -11,7 +11,12 @@ class PositionalEmbedding(nn.Module):
         self.pos_embedding = nn.Embedding(max_len, d_model)
 
     def forward(self, x):
-        # x shape: (batch_size, seq_len)
+        """
+        Input: 
+            x: token indices [batch_size, seq_len]
+        Output: 
+            positional embeddings [batch_size, seq_len, d_model]
+        """
         seq_len = x.size(1)
         positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand_as(x)
         return self.pos_embedding(positions)
@@ -28,6 +33,12 @@ class FeedForward(torch.nn.Module):
 		self.activation = torch.nn.GELU()
 
 	def forward(self, x):
+		"""
+		Input: 
+			x: embeddings [batch_size, seq_len, d_model]
+		Output: 
+			transformed embeddings [batch_size, seq_len, d_model]
+		"""
 		out = self.activation(self.fc1(x))
 		out = self.fc2(self.dropout(out))
 		return out
@@ -39,10 +50,20 @@ class ScaledDotProductAttention(nn.Module):
         self.d_k = d_k
 
     def forward(self, query, key, value, mask=None):
+        """
+        Inputs:
+            query: [batch_size, heads, seq_len, d_k]
+            key: [batch_size, heads, seq_len, d_k]
+            value: [batch_size, heads, seq_len, d_k]
+            mask: optional [batch_size, 1, 1, seq_len]
+        Output: 
+            attention output [batch_size, heads, seq_len, d_k]
+            attention weights [batch_size, heads, seq_len, seq_len]
+        """
         assert(self.d_k == query.size(-1))
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.d_k)
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
+            scores = scores.masked_fill(mask == 0, -1e4)
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
 
@@ -64,6 +85,15 @@ class MultiHeadedAttention(nn.Module):
         self.attention = ScaledDotProductAttention(dropout, self.d_k)
     
     def forward(self, query, key, value, mask=None):
+        """
+        Inputs:
+            query: [batch_size, seq_len, d_model]
+            key: [batch_size, seq_len, d_model]
+            value: [batch_size, seq_len, d_model]
+            mask: optional [batch_size, 1, 1, seq_len]
+        Output: 
+            attention output [batch_size, seq_len, d_model]
+        """
         B, L, _ = query.size()
 
         Q = self.q_linear(query).view(B, L, self.heads, self.d_k).transpose(1, 2)  # [B, h, L, d_k]
@@ -95,6 +125,12 @@ class MaskedLanguageModel(torch.nn.Module):
 		self.softmax = torch.nn.LogSoftmax(dim=-1)
 
 	def forward(self, x):
+		"""
+		Input: 
+			x: hidden states [batch_size, seq_len, d_model]
+		Output: 
+			log probabilities [batch_size, seq_len, vocab_size]
+		"""
 		return self.softmax(self.linear(x))
 
 class EncoderLayer(torch.nn.Module):
@@ -112,9 +148,13 @@ class EncoderLayer(torch.nn.Module):
 		self.dropout = torch.nn.Dropout(dropout)
 
 	def forward(self, embeddings, mask):
-		# embeddings: (batch_size, max_len, d_model)
-		# encoder mask: (batch_size, 1, 1, max_len)
-		# result: (batch_size, max_len, d_model)
+		"""
+		Inputs:
+			embeddings: [batch_size, seq_len, d_model]
+			mask: [batch_size, 1, 1, seq_len]
+		Output: 
+			encoded representations [batch_size, seq_len, d_model]
+		"""
 		interacted = self.dropout(self.self_multihead(embeddings, embeddings, embeddings, mask))
 		# residual layer
 		interacted = self.layernorm(interacted + embeddings)
@@ -149,6 +189,12 @@ class BERTEmbedding(torch.nn.Module):
 		self.dropout = torch.nn.Dropout(p=dropout)
 	   
 	def forward(self, sequence):
+		"""
+		Input: 
+			sequence: token indices [batch_size, seq_len]
+		Output: 
+			combined embeddings [batch_size, seq_len, embed_size]
+		"""
 		token_embedding = self.token(sequence)
 		position_embedding = self.position(sequence)
 		x = token_embedding + position_embedding
@@ -174,7 +220,6 @@ class BERT(torch.nn.Module):
 		self.heads = heads
 		self.seq_len = seq_len
 
-		# paper noted they used 4 * hidden_size for ff_network_hidden_size
 		self.feed_forward_hidden = d_model * 2
 
 		# embedding for BERT, sum of positional, segment, token embeddings
@@ -187,6 +232,12 @@ class BERT(torch.nn.Module):
 		self.device = device
 
 	def forward(self, x):
+		"""
+		Input: 
+			x: token indices [batch_size, seq_len]
+		Output: 
+			MLM logits [batch_size, seq_len, vocab_size]
+		"""
 		# attention masking for padded token
 		# (batch_size, 1, seq_len, seq_len)
 		# mask = (x > 0).unsqueeze(1).repeat(1, x.size(1), 1).unsqueeze(1)
@@ -203,6 +254,12 @@ class BERT(torch.nn.Module):
 		return x
 
 	def encode(self, input):
+		"""
+		Input: 
+			input: token indices [batch_size, seq_len]
+		Output: 
+			pooled representation [batch_size, d_model]
+		"""
 		input = input.to(self.device)
 		mask = (input > 0).unsqueeze(1).unsqueeze(2)  # (B,1,1,L)
 		x = self.embedding(input)
@@ -211,9 +268,58 @@ class BERT(torch.nn.Module):
 		attention_mask = (input > 0).float().unsqueeze(-1)  # (B,L,1)
 		summed = torch.sum(x * attention_mask, dim=1)
 		return summed
-	
+
+class BaseBERT(nn.Module):
+    def __init__(self, vocab_size, d_model=128, n_layers=12, 
+                 heads=8, seq_len=128, dropout=0.1, device="cuda"):
+        super().__init__()
+        self.device = device
+        self.seq_len = seq_len
+        
+        # 共享的BERT编码器
+        self.bert = BERT(vocab_size, d_model, n_layers, heads, seq_len, dropout, device)
+        
+        # MLM任务头
+        self.mlm_head = MaskedLanguageModel(d_model, vocab_size)
+
+    def forward(self, input_dict):
+        """
+        Unified interface for MLM tasks
+        Input: 
+            input_dict: dictionary with task-specific keys (assumed to be on correct device)
+        Output: 
+            (loss, logits) tuple
+        """
+        task_type = input_dict['task_type']
+        
+        if task_type == 'mlm':
+            return self.forward_mlm(input_dict['input_ids'], input_dict['labels'])
+        else:
+            raise ValueError(f"Unknown Task Type: {task_type}")
+
+    def forward_mlm(self, input_ids, labels):
+        """
+        Inputs (assumed to be on correct device):
+            input_ids: token indices [batch_size, seq_len]
+            labels: target token IDs [batch_size, seq_len]
+        Output: 
+            (loss, logits) where logits [batch_size, seq_len, vocab_size]
+        """
+        logits = self.bert(input_ids)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=0)
+        return loss, logits
+
+    def encode(self, input_ids):
+        """
+        Input (assumed to be on correct device):
+            input_ids: token indices [batch_size, seq_len]
+        Output: 
+            block embedding [batch_size, d_model]
+        """
+        return self.bert.encode(input_ids)
+
 class ANPHead(nn.Module):
-    def __init__(self, hidden_dim=768):
+    def __init__(self, hidden_dim):
         super().__init__()
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -222,45 +328,351 @@ class ANPHead(nn.Module):
         )
 
     def forward(self, vec_a, vec_b):
+        """
+        Inputs:
+            vec_a: block embedding [batch_size, d_model]
+            vec_b: block embedding [batch_size, d_model]
+        Output: 
+            adjacency logits [batch_size, 2]
+        """
         x = torch.cat([vec_a, vec_b], dim=1)
         return self.classifier(x)
 	
-class BERT2(nn.Module):
-    def __init__(self, vocab_size, d_model=128, n_layers=12, heads=8, seq_len=128, dropout=0.1, device="cuda"):
-        super().__init__()
-        self.seq_len = seq_len
-        self.bert = BERT(vocab_size, d_model, n_layers, heads, seq_len, dropout, device)
-        self.anp_head = ANPHead(hidden_dim=d_model)
-        self.loss_fn = nn.CrossEntropyLoss()
-        self.device = device
+class BERT2(BaseBERT):
+    def __init__(self, vocab_size, d_model=128, n_layers=12, 
+                 heads=8, seq_len=128, dropout=0.1, device="cuda"):
+        super().__init__(vocab_size, d_model, n_layers, heads, seq_len, dropout, device)
+        
+        # ANP任务头
+        self.anp_head = ANPHead(d_model)
 
-    def forward_mlm(self, input_ids, labels):
+    def forward(self, input_dict):
         """
-        :param input_ids: [B, L]
-        :param labels: [B, L]
-        :return: mlm_loss, prediction_logits
+        Unified interface for MLM and ANP tasks
+        Input: 
+            input_dict: dictionary with task-specific keys (assumed to be on correct device)
+        Output: 
+            (loss, logits) tuple
         """
-        logits = self.bert(input_ids)
-        loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
-        return loss, logits
+        task_type = input_dict['task_type']
+        
+        if task_type == 'mlm':
+            return self.forward_mlm(input_dict['input_ids'], input_dict['labels'])
+        elif task_type == 'anp':
+            return self.forward_anp(
+                input_dict['input_a'], 
+                input_dict['input_b'], 
+                input_dict['labels']
+            )
+        else:
+            raise ValueError(f"Unknown Task Type: {task_type}")
 
-    def forward_anp(self, input_ids_a, input_ids_b, label):
+    def forward_anp(self, input_a, input_b, labels):
         """
-        :param input_ids_a: [B, L]
-        :param input_ids_b: [B, L]
-        :param label: [B] binary label: 0/1
-        :return: anp_loss, prediction_logits
+        judge whether two blocks are adjacent in a graph
+        Inputs (assumed to be on correct device):
+            input_a: block A tokens [batch_size, seq_len]
+            input_b: block B tokens [batch_size, seq_len]
+            labels: adjacency labels [batch_size]
+        Output: 
+            (loss, logits) where logits [batch_size, 2]
         """
-        vec_a = self.bert.encode(input_ids_a)
-        vec_b = self.bert.encode(input_ids_b)
+        vec_a = self.encode(input_a)
+        vec_b = self.encode(input_b)
         logits = self.anp_head(vec_a, vec_b)
-        loss = self.loss_fn(logits, label)
+        loss = F.cross_entropy(logits, labels)
         return loss, logits
 
-    def encode(self, input_ids):
+class BIGHead(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            # Binary classification: same graph / different graph
+            nn.Linear(hidden_dim, 2)  
+        )
+
+    def forward(self, vec_a, vec_b):
         """
-        获取block embedding
-        :param input_ids: [B, L]
-        :return: [B, D]
+        Inputs:
+            vec_a: block embedding [batch_size, d_model]
+            vec_b: block embedding [batch_size, d_model]
+        Output: 
+            same-graph logits [batch_size, 2]
         """
-        return self.bert.encode(input_ids)
+        x = torch.cat([vec_a, vec_b], dim=1)
+        return self.classifier(x)
+
+class GraphClassificationHead(nn.Module):
+    def __init__(self, hidden_dim, num_classes):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            # Multi-class: different platforms/optimization options
+            nn.Linear(hidden_dim, num_classes)
+        )
+
+    def forward(self, vec):
+        """
+        Input: 
+            vec: block embedding [batch_size, d_model]
+        Output: 
+            class logits [batch_size, num_classes]
+        """
+        return self.classifier(vec)
+
+class BERT4(BERT2):
+    def __init__(self, vocab_size, num_classes, d_model=128, n_layers=12, 
+                 heads=8, seq_len=128, dropout=0.1, device="cuda"):
+        super().__init__(vocab_size, d_model, n_layers, heads, seq_len, dropout, device)
+        
+        # 添加两个新任务头
+        self.big_head = BIGHead(d_model)  # 块是否在同一图中任务
+        self.gc_head = GraphClassificationHead(d_model, num_classes)  # 图分类任务
+
+    def forward(self, input_dict):
+        """
+        Unified interface for 4 tasks (MLM, ANP, BIG, GC)
+        Input: 
+            input_dict: dictionary with task-specific keys (assumed to be on correct device)
+        Output: 
+            (loss, logits) tuple
+        """
+        task_type = input_dict['task_type']
+        
+        if task_type in ['mlm', 'anp']:
+            return super().forward(input_dict)
+        elif task_type == 'big':
+            return self.forward_big(
+                input_dict['input_a'], 
+                input_dict['input_b'], 
+                input_dict['labels']
+            )
+        elif task_type == 'gc':
+            return self.forward_gc(
+                input_dict['input_ids'], 
+                input_dict['labels']
+            )
+        else:
+            raise ValueError(f"Unknown Task Type: {task_type}")
+
+    def forward_big(self, input_a, input_b, labels):
+        """
+        Inputs (assumed to be on correct device):
+            input_a: block A tokens [batch_size, seq_len]
+            input_b: block B tokens [batch_size, seq_len]
+            labels: same-graph labels [batch_size]
+        Output: 
+            (loss, logits) where logits [batch_size, 2]
+        """
+        vec_a = self.encode(input_a)
+        vec_b = self.encode(input_b)
+        logits = self.big_head(vec_a, vec_b)
+        loss = F.cross_entropy(logits, labels)
+        return loss, logits
+
+    def forward_gc(self, input_ids, labels):
+        """
+        Inputs (assumed to be on correct device):
+            input_ids: token indices [batch_size, seq_len]
+            labels: graph class labels [batch_size]
+        Output: 
+            (loss, logits) where logits [batch_size, num_classes]
+        """
+        vec = self.encode(input_ids)
+        logits = self.gc_head(vec)
+        loss = F.cross_entropy(logits, labels)
+        return loss, logits
+
+
+class MPNNLayer(nn.Module):
+    def __init__(self, in_dim, hidden_dim):
+        super().__init__()
+        self.message_func = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU()
+        )
+        self.update_func = nn.GRUCell(hidden_dim, in_dim)
+
+    def forward(self, h, adj):
+        """
+        Inputs:
+            h: node features [batch_size, num_nodes, in_dim]
+            adj: adjacency matrix [batch_size, num_nodes, num_nodes]
+        Output: 
+            updated node features [batch_size, num_nodes, in_dim]
+        """
+        # Message aggregation: m_v = Σ_{w∈N(v)} MLP(h_w)
+        m = torch.matmul(adj, self.message_func(h))
+        # Update node features: h_v = GRU(h_v, m_v)
+        batch_size, num_nodes, _ = h.shape
+        h_flat = h.reshape(-1, h.size(-1))
+        m_flat = m.reshape(-1, m.size(-1))
+        updated_flat = self.update_func(m_flat, h_flat)
+        return updated_flat.reshape(batch_size, num_nodes, -1)
+
+class MPNN(nn.Module):
+    def __init__(self, in_dim, hidden_dim, n_steps=5):
+        super().__init__()
+        self.n_steps = n_steps
+        self.mpnn_layer = MPNNLayer(in_dim, hidden_dim)
+        self.readout = nn.Sequential(
+            nn.Linear(in_dim * 2, hidden_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, h0, adj):
+        """
+        Inputs:
+            h0: initial node features [batch_size, num_nodes, in_dim]
+            adj: adjacency matrix [batch_size, num_nodes, num_nodes]
+        Output: 
+            graph embedding [batch_size, hidden_dim]
+        """
+        h = h0
+        # Run T steps of message passing
+        for _ in range(self.n_steps):
+            h = self.mpnn_layer(h, adj)
+        
+        # Read out features at step 0 and step T and concatenate
+        h0_sum = torch.sum(h0, dim=1)  # [batch_size, in_dim]
+        hT_sum = torch.sum(h, dim=1)   # [batch_size, in_dim]
+        combined = torch.cat([h0_sum, hT_sum], dim=1)
+        
+        # Generate graph embedding
+        return self.readout(combined)
+
+class ResNetBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        """
+        Input: 
+            x: feature maps [batch_size, channels, height, width]
+        Output: 
+            transformed features [batch_size, channels, height, width]
+        """
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        return F.relu(out)
+
+class OrderCNN(nn.Module):
+    def __init__(self, in_channels=1, num_blocks=3, out_features=32):
+        super().__init__()
+        # Initial convolutional layer
+        self.conv_in = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
+        self.bn_in = nn.BatchNorm2d(32)
+        
+        # Residual blocks
+        self.res_blocks = nn.Sequential()
+        for i in range(num_blocks):
+            self.res_blocks.add_module(f"res_block_{i}", ResNetBlock(32))
+        
+        # Global max pooling
+        self.pool = nn.AdaptiveMaxPool2d((1, 1))
+        
+        # Output layer
+        self.fc_out = nn.Linear(32, out_features)
+
+    def forward(self, adj):
+        """
+        Input: 
+            adj: adjacency matrix [batch_size, num_nodes, num_nodes]
+        Output: 
+            order embedding [batch_size, out_features]
+        """
+        # Add channel dimension [batch_size, 1, num_nodes, num_nodes]
+        x = adj.unsqueeze(1)
+        
+        # Initial convolution
+        x = F.relu(self.bn_in(self.conv_in(x)))
+        
+        # Residual blocks
+        x = self.res_blocks(x)
+        
+        # Global pooling [batch_size, 32, 1, 1]
+        x = self.pool(x)
+        
+        # Flatten [batch_size, 32]
+        x = x.view(x.size(0), -1)
+        
+        # Output layer [batch_size, out_features]
+        return self.fc_out(x)
+
+
+class SemanticAwareModel(nn.Module):
+    """
+    Complete semantic-aware model integrating three components:
+    1. Semantic-aware modeling (BERT4)
+    2. Structure-aware modeling (MPNN)
+    3. Order-aware modeling (OrderCNN)
+    """
+    def __init__(self, bert4_model, d_model=128, hidden_dim=64, device="cuda"):
+        """
+        :param bert4_model: Pretrained BERT4 model
+        :param d_model: Output embedding dimension of BERT4
+        :param hidden_dim: Final graph embedding dimension
+        :param device: Computing device
+        """
+        super().__init__()
+        self.device = device
+        self.bert4 = bert4_model
+        
+        # Structure-aware modeling component
+        self.mpnn = MPNN(in_dim=d_model, hidden_dim=d_model, n_steps=5)
+        
+        # Order-aware modeling component
+        self.order_cnn = OrderCNN(in_channels=1, num_blocks=3)
+        
+        # Fusion layer
+        self.fusion = nn.Sequential(
+            nn.Linear(d_model + 32, hidden_dim),  # 32 is the output dimension of OrderCNN
+            nn.ReLU()
+        )
+    
+    def forward(self, input_ids, adj_matrix):
+        """
+        Input:
+            input_ids: token sequences [batch_size, num_nodes, seq_len]
+            adj_matrix: adjacency matrix [batch_size, num_nodes, num_nodes]
+        
+        Output:
+            graph embedding [batch_size, hidden_dim]
+        """
+        batch_size, num_nodes, seq_len = input_ids.shape
+        
+        # === Semantic-aware modeling ===
+        # Flatten node dimension [batch_size * num_nodes, seq_len]
+        flat_input_ids = input_ids.reshape(batch_size * num_nodes, seq_len)
+        
+        # Get block embeddings [batch_size * num_nodes, d_model]
+        block_embeddings = self.bert4.encode(flat_input_ids)
+        
+        # Restore node dimension [batch_size, num_nodes, d_model]
+        node_features = block_embeddings.reshape(batch_size, num_nodes, -1)
+        
+        # === Structure-aware modeling ===
+        # Generate graph structure embedding [batch_size, d_model]
+        structure_embedding = self.mpnn(node_features, adj_matrix)
+        
+        # === Order-aware modeling ===
+        # Generate order embedding [batch_size, 32]
+        order_embedding = self.order_cnn(adj_matrix)
+        
+        # === Fusion ===
+        # Concatenate structure and order embeddings [batch_size, d_model + 32]
+        combined = torch.cat([structure_embedding, order_embedding], dim=-1)
+        
+        # Generate final graph embedding [batch_size, hidden_dim]
+        graph_embedding = self.fusion(combined)
+        
+        return graph_embedding
