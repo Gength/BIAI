@@ -19,7 +19,7 @@ class PositionalEmbedding(nn.Module):
 class FeedForward(torch.nn.Module):
 	"Implements FFN equation."
 
-	def __init__(self, d_model, middle_dim=2048, dropout=0.1):
+	def __init__(self, d_model, middle_dim=256, dropout=0.1):
 		super(FeedForward, self).__init__()
 		
 		self.fc1 = torch.nn.Linear(d_model, middle_dim)
@@ -71,7 +71,7 @@ class MultiHeadedAttention(nn.Module):
         V = self.v_linear(value).view(B, L, self.heads, self.d_k).transpose(1, 2)
 
         if mask is not None:
-            pass
+            mask = mask.expand(-1, self.heads, -1, -1)
 
 
         attn_output, _ = self.attention(Q, K, V, mask)  # [B, h, L, d_k]
@@ -133,7 +133,7 @@ class BERTEmbedding(torch.nn.Module):
 		sum of all these features are output of BERTEmbedding
 	"""
 
-	def __init__(self, vocab_size, embed_size, seq_len=64, dropout=0.1):
+	def __init__(self, vocab_size, embed_size=128, seq_len=128, dropout=0.1):
 		"""
 		:param vocab_size: total vocab size
 		:param embed_size: embedding size of token embedding
@@ -159,7 +159,7 @@ class BERT(torch.nn.Module):
 	BERT model : Bidirectional Encoder Representations from Transformers.
 	"""
 
-	def __init__(self, vocab_size, d_model=768, n_layers=12, heads=12, dropout=0.1, device="cuda"):
+	def __init__(self, vocab_size, d_model=128, n_layers=12, heads=8, seq_len=128,dropout=0.1,  device="cuda"):
 		"""
 		:param vocab_size: vocab_size of total words
 		:param hidden: BERT model hidden size
@@ -172,16 +172,17 @@ class BERT(torch.nn.Module):
 		self.d_model = d_model
 		self.n_layers = n_layers
 		self.heads = heads
+		self.seq_len = seq_len
 
 		# paper noted they used 4 * hidden_size for ff_network_hidden_size
-		self.feed_forward_hidden = d_model * 4
+		self.feed_forward_hidden = d_model * 2
 
 		# embedding for BERT, sum of positional, segment, token embeddings
-		self.embedding = BERTEmbedding(vocab_size=vocab_size, embed_size=d_model)
+		self.embedding = BERTEmbedding(vocab_size=vocab_size, embed_size=d_model, seq_len=seq_len)
 
 		# multi-layers transformer blocks, deep network
 		self.encoder_blocks = torch.nn.ModuleList(
-			[EncoderLayer(d_model, heads, d_model * 4, dropout) for _ in range(n_layers)])
+			[EncoderLayer(d_model, heads, d_model * 2, dropout) for _ in range(n_layers)])
 		self.mask_lm = MaskedLanguageModel(self.d_model, vocab_size)
 		self.device = device
 
@@ -210,3 +211,56 @@ class BERT(torch.nn.Module):
 		attention_mask = (input > 0).float().unsqueeze(-1)  # (B,L,1)
 		summed = torch.sum(x * attention_mask, dim=1)
 		return summed
+	
+class ANPHead(nn.Module):
+    def __init__(self, hidden_dim=768):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 2)
+        )
+
+    def forward(self, vec_a, vec_b):
+        x = torch.cat([vec_a, vec_b], dim=1)
+        return self.classifier(x)
+	
+class BERT2(nn.Module):
+    def __init__(self, vocab_size, d_model=128, n_layers=12, heads=8, seq_len=128, dropout=0.1, device="cuda"):
+        super().__init__()
+        self.seq_len = seq_len
+        self.bert = BERT(vocab_size, d_model, n_layers, heads, seq_len, dropout, device)
+        self.anp_head = ANPHead(hidden_dim=d_model)
+        self.loss_fn = nn.CrossEntropyLoss()
+        self.device = device
+
+    def forward_mlm(self, input_ids, labels):
+        """
+        :param input_ids: [B, L]
+        :param labels: [B, L]
+        :return: mlm_loss, prediction_logits
+        """
+        logits = self.bert(input_ids)
+        loss = self.loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+        return loss, logits
+
+    def forward_anp(self, input_ids_a, input_ids_b, label):
+        """
+        :param input_ids_a: [B, L]
+        :param input_ids_b: [B, L]
+        :param label: [B] binary label: 0/1
+        :return: anp_loss, prediction_logits
+        """
+        vec_a = self.bert.encode(input_ids_a)
+        vec_b = self.bert.encode(input_ids_b)
+        logits = self.anp_head(vec_a, vec_b)
+        loss = self.loss_fn(logits, label)
+        return loss, logits
+
+    def encode(self, input_ids):
+        """
+        获取block embedding
+        :param input_ids: [B, L]
+        :return: [B, D]
+        """
+        return self.bert.encode(input_ids)

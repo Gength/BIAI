@@ -1,5 +1,8 @@
-CPU_WIDTH = 64
-
+import multiprocessing
+import os
+import pickle
+import re
+from scipy.sparse import lil_matrix
 def filter_near(op):
     return '<NEAR>'
 
@@ -119,9 +122,7 @@ def disassemble_function(binary_path, function_address=None, function_name=None)
     project = angr.Project(binary_path, auto_load_libs=False)
     
     # 构建控制流图(CFG)
-    cfg = project.analyses.CFGFast(normalize=True,
-                                  resolve_indirect_jumps=True,
-                                  data_references=True)
+    cfg = project.analyses.CFGFast()
     
     # 获取目标函数
     target_func = None
@@ -177,6 +178,7 @@ def normalize_instruction(inst_str):
     :param inst_str: 汇编指令字符串
     :return: 归一化后的指令字符串
     """
+    CPU_WIDTH = 64  # 假设使用64位架构
     def unsigned2signed(number, width):
         """将无符号数转换为有符号数"""
         if number >= 2**(width-1):
@@ -364,49 +366,113 @@ def normalize_instruction(inst_str):
     
     return normalized_inst
 
-# 测试代码
+def load_assembly_data(data):
+    data_pairs = []
+    for item in data:
+        if item[0].startswith('0x'):
+            temp = []
+            for datum in item:
+                instr=str.split(datum, '\t')[1:]
+                instr = ' '.join(instr)
+                temp.append(instr)
+            item = temp
+        normalized = [normalize_instruction(inst) for inst in item]
+        if len(normalized) % 2 != 0:
+            normalized.append('nop')
+        for i in range(0, len(normalized)-1, 2):
+            # Skip if either instruction is empty after normalization
+            
+                # Ensure both instructions are not empty
+            data_pairs.append((normalized[i].strip(), normalized[i+1].strip()))
+    return data_pairs
+
+def process_binary_file(args):
+        binary_path, save_path = args
+        binary_name = os.path.split(binary_path)[-1]
+        try:
+            results = dict()
+            proj = angr.Project(binary_path, auto_load_libs=False)
+            cfg = proj.analyses.CFGFast()
+            
+            for addr, func in cfg.functions.items():
+                if func.name in ['UnresolvableCallTarget', 'UnresolvableJumpTarget']:
+                    continue
+                # 先检查基本块数量
+                blocks = list(func.blocks)
+                n_blocks = len(blocks)
+                if n_blocks <= 5:
+                    continue
+                
+                # 初始化函数条目
+                if func.name not in results:
+                    results[func.name] = dict()
+
+                # 创建地址到索引的映射
+                # 按地址排序基本块以确保一致的索引顺序
+                sorted_blocks = sorted(blocks, key=lambda b: b.addr)
+                block_addrs = [block.addr for block in sorted_blocks]
+                addr_to_idx = {addr: idx for idx, addr in enumerate(block_addrs)}
+                # 保存地址到索引的映射
+                results[func.name]['addr_to_idx'] = addr_to_idx
+                # 初始化邻接矩阵
+                adj_matrix = lil_matrix((n_blocks, n_blocks), dtype=int)
+
+                for block in sorted_blocks:
+                    # 生成邻接矩阵
+                    node = cfg.model.get_any_node(block.addr)
+                    succ = getattr(node, 'successors', [])
+                    for succ_node in succ:
+                        if succ_node.addr in block_addrs:
+                            src_idx = addr_to_idx[block.addr]
+                            dest_idx = addr_to_idx[succ_node.addr]
+                            adj_matrix[src_idx, dest_idx] = 1
+
+                    results[func.name][block.addr] = []
+                    # 归一化指令
+                    for insn in block.capstone.insns:
+                        normalized_insn = normalize_instruction_assembly_code(
+                            insn, 
+                            proj.arch.bits
+                        )
+                        results[func.name][block.addr].append(normalized_insn)
+                # 将稀疏矩阵转换为可序列化的格式（如COO格式）
+                results[func.name]['adjacency_matrix'] = adj_matrix.tocoo()
+
+        except Exception as e:
+            print(f"Error processing {binary_name}: {e}")
+        if any(results.values()):
+            with open(os.path.join(save_path, "output_"+binary_name+".pkl"), "wb") as f:
+                pickle.dump(results, f)
+        else:
+            print(f"Warning: No results for {binary_name}, skipping save.")
+
+from tqdm import tqdm
 if __name__ == "__main__":
-    # 您的指令列表
-    instructions = [
-        'mov esi, 2',
-        'mov rbp, rsp',
-        'mov edx, 2',
-        'mov eax, 1',
-        'mov qword ptr [rbp - 8], rdi',
-        'call 0x6380a0',
-        'add rsp, 0x10',
-        'call 0x61ba30',
-        'mov rdi, qword ptr [rbp - 8]',
-        'ret ',
-        'mov rax, qword ptr [rbp - 8]',
-        'mov qword ptr [rbp - 0x10], rdi',
-        'mov rdi, rax',
-        'pop rbp',
-        'sub rsp, 0x10',
-        'call 0x61ac30',
-        'push rbp',
-        'mov esi, 1',
-        'mov esi, eax',
-        'mov rdi, qword ptr [rbp - 0x10]',
-        # 添加测试负数的指令
-        'sub eax, -0x80',       # 负十六进制
-        'add ebx, -128',        # 负十进制
-        'mov ecx, -10h',        # 带h后缀的负数
-        'cmp edx, +0x20',       # 带+号的十六进制
-        'lea eax, [rbp - 0x100]',  # 内存中的大负数
-        # 添加测试前缀的指令
-        'bnd jns 0x14efe2f',    # 带bnd前缀的跳转
-        'rep movsb',            # 带rep前缀的字符串操作
-        'lock cmpxchg [rdi], rdx',  # 带lock前缀的原子操作
-        'bnd call 0x123456',    # 带bnd前缀的调用
-        'repne scasb',          # 带repne前缀的字符串扫描
-        'bnd'                   # 只有前缀没有操作码的情况
-    ]
-    
-    # 归一化所有指令
-    normalized = [normalize_instruction(inst) for inst in instructions]
-    
-    # 打印结果
-    print("原始指令 => 归一化指令")
-    for orig, norm in zip(instructions, normalized):
-        print(f"{orig.ljust(40)} => {norm}")
+    data_dir = '.'
+    binary_folder = os.path.join(data_dir, "Dataset-1")
+
+    save_root = "baseline"
+    os.makedirs(save_root, exist_ok=True)
+    architecture = ['x86', 'x64']
+    compiler = ['gcc']
+    tasks = []
+    for subfolder in os.listdir(binary_folder):
+        subfolder_path = os.path.join(binary_folder, subfolder)
+        # if not os.path.isdir(subfolder_path):
+        #     continue
+        save_path = os.path.join(save_root, subfolder)
+        os.makedirs(save_path, exist_ok=True)
+        for bin_name in os.listdir(subfolder_path):
+            bin_path = os.path.join(subfolder_path, bin_name)
+            if(os.path.isfile(os.path.join(save_path, "output_"+bin_name+".pkl"))):
+                continue
+            key_words = re.split('[-_]', bin_name)
+            intersection = len(set(key_words) & set(architecture)) > 0 and len(set(key_words) & set(compiler)) > 0
+            # 如果二进制文件名中没有关键字或架构信息，则跳过
+            if intersection:
+                tasks.append((bin_path, save_path))
+
+    # num_processes = min(multiprocessing.cpu_count(), len(tasks))
+    num_processes = 12
+    with multiprocessing.Pool(processes=num_processes) as pool:
+        list(tqdm(pool.imap_unordered(process_binary_file, tasks), total=len(tasks)))

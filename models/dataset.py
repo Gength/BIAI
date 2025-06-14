@@ -3,89 +3,101 @@ from torch.utils.data import Dataset
 import random
 import pandas as pd
 import numpy as np
+from scipy.sparse import lil_matrix
 
-class BERTDataset(Dataset):
-	def __init__(self, data_pairs: pd.DataFrame, tokenizer, seq_len=16, device="cuda", train=True):
+class BERTMLMDataset(Dataset):
+	def __init__(self, instr_blocks, tokenizer, max_len=128, train=True):
 		self.tokenizer = tokenizer
-		self.seq_len = seq_len
-		self.corpus_lines = len(data_pairs)
-		self.lines:pd.DataFrame = data_pairs
-		self.device = device
+		self.max_len = max_len
+		self.instr_blocks = instr_blocks
 		self.train = train
 
 
 	def __len__(self):
-		return len(self.lines)
+		return len(self.instr_blocks)
 		
-	def random_word(self, tokens):
-		''' a parallel implementation of random_word function'''
-		# convert tokens to numpy array for random operations
-		tokens_arr = np.array(tokens)
-		
-		# Randomly mask some tokens
-		mask_prob = np.random.rand(len(tokens_arr)) < 0.15
-
-		# generate a random strategy for each token
-		# < 8: replace with <MASK>
-		# == 8: replace with random token
-		# > 8: keep original token
-		strategy = np.random.randint(0, 10, size=len(tokens_arr))
-
-		output = np.copy(tokens_arr)
-		labels = np.zeros_like(tokens_arr)
-
-		# get the mask token id
-		mask_token_id = self.tokenizer.vocab['<MASK>']
-		# get the random token ids
-		random_tokens = np.random.randint(0, len(self.tokenizer.vocab), size=len(tokens_arr))
-		# apply the masking strategy
-		if np.any(mask_prob):
-        	# create boolean masks for each strategy
-			mask_strategy = mask_prob & (strategy < 8)    # 80% MASK
-			rand_strategy = mask_prob & (strategy == 8)   # 10% 随机词
-			
-			# apply the strategies
-			output[mask_strategy] = mask_token_id
-			output[rand_strategy] = random_tokens[rand_strategy]
-			
-			# set the labels
-			labels[mask_prob] = tokens_arr[mask_prob]
+	def random_mask(self, ids):
+		output = []
+		labels = []
+		for id in ids:
+			if random.random() < 0.15:
+				if random.random() < 0.8:
+					output.append(self.tokenizer.vocab['<MASK>'])  # 80% Replace with MASK
+				elif random.random() < 0.9:
+					output.append(random.choice(list(self.tokenizer.vocab.values())))  # 10% Random token
+				else:
+					output.append(id)  # 10% Keep original
+				labels.append(id)
+			else:
+				output.append(id)
+				labels.append(0)
 		assert(len(output) == len(labels))
-		return output.tolist(), labels.tolist()
+		return output, labels
 		
 	def __getitem__(self, idx):
-		t1, t2 = self.get_sent(idx)
+		text = self.instr_blocks[idx]
+		ids: list = self.tokenizer.encode(text)
 
-		# Tokenizing Assembly Code
-		t1_tokens = self.tokenizer.encode(t1)
-		t2_tokens = self.tokenizer.encode(t2)
 
 		if self.train:
-			# Masking random words
-			t1_random, t1_label = self.random_word(t1_tokens)
-			t2_random, t2_label = self.random_word(t2_tokens)
+			ids, labels = self.random_mask(ids)
 		else:
-			t1_random = t1_tokens
-			t2_random = t2_tokens
-		
-		t1_random = t1_random[:self.seq_len] + [self.tokenizer.vocab['<PAD>']] * (self.seq_len - len(t1_random))
-		t2_random = t2_random[:self.seq_len] + [self.tokenizer.vocab['<PAD>']] * (self.seq_len - len(t2_random))
-		t1_label = t1_label[:self.seq_len] + [0] * (self.seq_len - len(t1_label))
-		t2_label = t2_label[:self.seq_len] + [0] * (self.seq_len - len(t2_label))
-		# Adding CLS and SEP tokens
-		t1 = [self.tokenizer.vocab['<CLS>']] + t1_random + [self.tokenizer.vocab['<SEP>']]
-		t2 = t2_random + [self.tokenizer.vocab['<SEP>']]
-		t1_label = [0] + t1_label + [0]
-		t2_label = t2_label + [0]
-		# Pad to fixed length
-		
-		bert_input = t1 + t2
-		bert_label = (t1_label + t2_label)
-		return {
-			"bert_input": torch.tensor(bert_input, dtype=torch.long),
-			"bert_label": torch.tensor(bert_label, dtype=torch.long)
-		}
-		
-	def get_sent(self, index):
-		t1, t2 = self.lines.iloc[index]
-		return t1, t2
+			labels = ids.copy()
+
+		# 预留 [CLS] 和 [SEP]，截断原始 tokens
+		ids = ids[:self.max_len - 2]
+		labels = labels[:self.max_len - 2]
+		pad_len = self.max_len - len(ids) - 2  # 减去 [CLS] 和 [SEP]
+		ids = [self.tokenizer.vocab['<CLS>']] + ids + [self.tokenizer.vocab['<SEP>']]
+		labels = [0] + labels + [0]
+
+		ids += [self.tokenizer.vocab['<PAD>']] * pad_len
+		labels += [0] * pad_len
+
+		ids = torch.tensor(ids, dtype=torch.long)
+		labels = torch.tensor(labels, dtype=torch.long)
+		return ids, labels
+
+class BERTANPDataset(Dataset):
+	def __init__(self, instr_blocks, tokenizer, adj, max_len=128):
+		self.tokenizer = tokenizer
+		self.adj = lil_matrix(tuple(adj['shape']), dtype=np.int32)
+		self.adj[adj['row'], adj['col']] = adj['data']
+		self.max_len = max_len
+		self.instr_blocks = instr_blocks
+
+		positive_pairs = list(zip(adj['row'], adj['col']))
+		block_ids = np.array([i for i in range(adj['shape'][0])])
+		negative_pairs = []
+		while len(negative_pairs) < len(positive_pairs):
+			i = random.choice(block_ids)
+			j = random.choice(block_ids)
+			if (i, j) not in positive_pairs:
+				negative_pairs.append((i, j))
+		self.pairs = positive_pairs + negative_pairs
+
+	def __len__(self):
+		return len(self.pairs)
+
+	def __getitem__(self, idx):
+		text_a_idx, text_b_idx = self.pairs[idx]
+		text_a = self.instr_blocks[text_a_idx]
+		text_b = self.instr_blocks[text_b_idx]
+
+		ids_a = self.tokenizer.encode(text_a)[:self.max_len - 2]
+		ids_b = self.tokenizer.encode(text_b)[:self.max_len - 2]
+
+		pad_len_a = self.max_len - len(ids_a) - 2
+		pad_len_b = self.max_len - len(ids_b) - 2
+
+		ids_a = [self.tokenizer.vocab['<CLS>']] + ids_a + [self.tokenizer.vocab['<SEP>']]
+		ids_b = [self.tokenizer.vocab['<CLS>']] + ids_b + [self.tokenizer.vocab['<SEP>']]
+
+		ids_a += [self.tokenizer.vocab['<PAD>']] * pad_len_a
+		ids_b += [self.tokenizer.vocab['<PAD>']] * pad_len_b
+
+		ids_a = torch.tensor(ids_a, dtype=torch.long)
+		ids_b = torch.tensor(ids_b, dtype=torch.long)
+
+		label = torch.tensor(self.adj[text_a_idx, text_b_idx], dtype=torch.long)
+		return ids_a, ids_b, label
