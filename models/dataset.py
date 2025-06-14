@@ -101,3 +101,17 @@ class BERTANPDataset(Dataset):
 
 		label = torch.tensor(self.adj[text_a_idx, text_b_idx], dtype=torch.long)
 		return ids_a, ids_b, label
+
+class TaskDataset(Dataset):
+	'''Wrap the dataset and add task type information'''
+	def __init__(self, dataset, task_type):
+		self.dataset = dataset
+		self.task_type = task_type
+		
+	def __len__(self):
+		return len(self.dataset)
+
+	def __getitem__(self, idx):
+		item = self.dataset[idx]
+		item["task_type"] = self.task_type
+		return item

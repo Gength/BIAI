@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import random
-from models.dataset import BERTMLMDataset, BERTANPDataset
+from models.dataset import BERTMLMDataset, BERTANPDataset, TaskDataset
 class MLMCollateFn:
     def __init__(self, tokenizer, seq_len=128, train=True):
         self.tokenizer = tokenizer
@@ -14,14 +14,25 @@ class MLMCollateFn:
         for batch in batches:
             instruction_blocks = batch["instruction_blocks"]
             mlm_dataset = BERTMLMDataset(instruction_blocks, self.tokenizer, max_len=self.seq_len, train=self.train)
-            for i in range(len(mlm_dataset)):
-                ids, labels = mlm_dataset[i]
+            # Only take one sample per graph to avoid data imbalance
+            if len(mlm_dataset) > 0:
+                idx = random.randint(0, len(mlm_dataset)-1)
+                ids, labels = mlm_dataset[idx]
                 ids_output.append(ids)
                 labels_output.append(labels)
-        # ids_output 和 labels_output 都是列表，转换为张量
+        # Handle empty batch case
+        if len(ids_output) == 0:
+            return torch.tensor([]), torch.tensor([])
+
+        # ids_output and labels_output are lists, convert to tensors
         ids_output = torch.stack(ids_output, dim=0)
         labels_output = torch.stack(labels_output, dim=0)
-        return ids_output, labels_output
+        return {
+            'task_type': 'mlm',
+            "input_ids": ids_output,
+            "labels": labels_output
+        }
+
 class ANPCollateFn:
     def __init__(self, tokenizer, seq_len=128):
         self.tokenizer = tokenizer
@@ -35,29 +46,40 @@ class ANPCollateFn:
             instruction_blocks = batch["instruction_blocks"]
             adj = batch["adjacency_matrix"]
             anp_dataset = BERTANPDataset(instruction_blocks, self.tokenizer, adj, max_len=self.seq_len)
-            for i in range(len(anp_dataset)):
-                ids_a, ids_b, label = anp_dataset[i]
+            # Only take one sample per graph to avoid data imbalance
+            if len(anp_dataset) > 0:
+                idx = random.randint(0, len(anp_dataset)-1)
+                ids_a, ids_b, label = anp_dataset[idx]
                 ids_a_output.append(ids_a)
                 ids_b_output.append(ids_b)
                 labels_output.append(label)
-        # ids_a_output, ids_b_output 和 labels_output 都是列表，转换为张量
+        # Handle empty batch case
+        if len(ids_a_output) == 0:
+            return torch.tensor([]), torch.tensor([]), torch.tensor([])
+        # ids_a_output, ids_b_output and labels_output are lists, convert to tensors
         ids_a_output = torch.stack(ids_a_output, dim=0)
         ids_b_output = torch.stack(ids_b_output, dim=0)
         labels_output = torch.tensor(labels_output, dtype=torch.long)
-        return ids_a_output, ids_b_output, labels_output
-
-class MLM_ANP_CollateFn:
-    def __init__(self, tokenizer, seq_len=128, train=True):
-        self.mlm_collate_fn = MLMCollateFn(tokenizer, seq_len, train)
-        self.anp_collate_fn = ANPCollateFn(tokenizer, seq_len)
-
-    def __call__(self, batches):
-        mlm_ids, mlm_labels = self.mlm_collate_fn(batches)
-        anp_ids_a, anp_ids_b, anp_labels = self.anp_collate_fn(batches)
         return {
-            "mlm_input_ids": mlm_ids,
-            "mlm_labels": mlm_labels,
-            "anp_input_ids_a": anp_ids_a,
-            "anp_input_ids_b": anp_ids_b,
-            "anp_labels": anp_labels
+            'task_type': 'anp',
+            "input_a": ids_a_output,
+            "input_b": ids_b_output,
+            "labels": labels_output
         }
+
+class CombinedCollateFn:
+    """Select different collate functions according to task type"""
+    def __init__(self, mlm_collate, anp_collate):
+        self.mlm_collate = mlm_collate
+        self.anp_collate = anp_collate
+    
+    def __call__(self, batches):
+        # All batches should have the same task type
+        task_type = batches[0]["task_type"]
+        
+        if task_type == "mlm":
+            return self.mlm_collate(batches)
+        elif task_type == "anp":
+            return self.anp_collate(batches)
+        else:
+            raise ValueError(f"Unknown task type: {task_type}")
