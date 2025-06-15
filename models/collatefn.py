@@ -17,16 +17,13 @@ class MLMCollateFn:
             mlm_dataset = BERTMLMDataset(instruction_blocks, self.tokenizer, max_len=self.seq_len, train=self.train)
             # Only take one sample per graph to avoid data imbalance
             if len(mlm_dataset) > 0:
-                if len(mlm_dataset) < self.samples_per_batch:
-                    # If dataset is smaller than samples_per_batch, take all samples
-                    idx = range(len(mlm_dataset))
-                else:
-                    # Randomly select samples from the dataset
-                    idx = random.sample(range(len(mlm_dataset)), self.samples_per_batch)
-                idx = random.randint(0, len(mlm_dataset)-1)
-                ids, labels = mlm_dataset[idx]
-                ids_output.append(ids)
-                labels_output.append(labels)
+                n_samples = min(len(mlm_dataset), self.samples_per_batch)
+
+                idx_set = random.sample(range(len(mlm_dataset)), n_samples)
+                for idx in idx_set:
+                    ids, labels = mlm_dataset[idx]
+                    ids_output.append(ids)
+                    labels_output.append(labels)
         # Handle empty batch case
         if len(ids_output) == 0:
             return torch.tensor([]), torch.tensor([])
@@ -56,16 +53,13 @@ class ANPCollateFn:
             anp_dataset = BERTANPDataset(instruction_blocks, self.tokenizer, adj, max_len=self.seq_len)
             # Only take one sample per graph to avoid data imbalance
             if len(anp_dataset) > 0:
-                if len(anp_dataset) < self.samples_per_batch:
-                    # If dataset is smaller than samples_per_batch, take all samples
-                    idx = range(len(anp_dataset))
-                else:
-                    # Randomly select samples from the dataset
-                    idx = random.sample(range(len(anp_dataset)), self.samples_per_batch)
-                ids_a, ids_b, label = anp_dataset[idx]
-                ids_a_output.append(ids_a)
-                ids_b_output.append(ids_b)
-                labels_output.append(label)
+                n_samples = min(len(anp_dataset), self.samples_per_batch)
+                idx_set = random.sample(range(len(anp_dataset)), n_samples)
+                for idx in idx_set:
+                    ids_a, ids_b, label = anp_dataset[idx]
+                    ids_a_output.append(ids_a)
+                    ids_b_output.append(ids_b)
+                    labels_output.append(label)
         # Handle empty batch case
         if len(ids_a_output) == 0:
             return torch.tensor([]), torch.tensor([]), torch.tensor([])

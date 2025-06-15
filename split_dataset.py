@@ -4,6 +4,7 @@ import pickle
 import pandas as pd
 from collections import defaultdict
 from sklearn.model_selection import train_test_split
+from models.tokenizer import AsmTokenizer
 BASELINE_DIR = os.path.join('.','baseline')
 OUTPUT_DIR = os.path.join('.','outputs')
 
@@ -111,6 +112,9 @@ def split_functions():
 import json
 # 定义处理单个split的函数
 def process_split_datasets(split):
+    if split == "test":
+        function_name_idx_map = {}
+        count = 0
     output_path = os.path.join(OUTPUT_DIR, f"baseline-{split}.jsonl")
     if(os.path.exists(output_path)):
         os.remove(output_path)
@@ -149,13 +153,21 @@ def process_split_datasets(split):
                 if split != "test":
                     out_file.write(json.dumps(output_obj, ensure_ascii=False) + '\n')
                 else:
-                    out_file.write(json.dumps({function_name : output_obj}, ensure_ascii=False) + '\n')
+                    function_name_idx_map[function_name] = count
+                    count += 1
+                    output_obj['function_name'] = function_name
+                    output_obj['project'] = project
+                    out_file.write(json.dumps(output_obj, ensure_ascii=False) + '\n')
+    if split == "test":
+        # 保存function_name_idx_map到文件
+        with open(os.path.join(OUTPUT_DIR, "function_name_idx_map.json"), "w") as f:
+            json.dump(function_name_idx_map, f, indent=4)
 
 from multiprocessing import Process
 if __name__ == '__main__':
-    # 把根据项目和函数名划分成三个数据集
+    # Split into three datasets based on project and function name
     split_functions()
-    # 创建三个进程分别生成数据集
+    # Create three processes to generate datasets separately
     splits = ["train", "val", "test"]
     processes = []
     
@@ -164,6 +176,19 @@ if __name__ == '__main__':
         processes.append(p)
         p.start()
     
-    # 等待所有进程完成
+    # synchronize processes
     for p in processes:
         p.join()
+    
+    # build vocab
+    vocab = {"<PAD>": 0, "<CLS>": 1, "<SEP>": 2, "<MASK>": 3, "<UNK>": 4, "<const>": 5}
+    from datasets import load_dataset
+    tokenizer = AsmTokenizer(vocab_file=os.path.join(OUTPUT_DIR, "baseline-vocab.txt"))
+    tokenizer.vocab = vocab  # Use the predefined vocab
+    for dataset_name in ["baseline-train", "baseline-val", "baseline-test"]:
+        dataset_path = os.path.join(".", "outputs", f"{dataset_name}.jsonl")
+        dataset = load_dataset('json', data_files=dataset_path, split="train", streaming=True)
+        for data in dataset:
+                tokenizer.build_vocab(data['instruction_blocks'])
+    # Save vocab to file
+    tokenizer.save_vocab(os.path.join(OUTPUT_DIR, "baseline-vocab.txt"))

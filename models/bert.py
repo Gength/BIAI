@@ -306,7 +306,7 @@ class BaseBERT(nn.Module):
             (loss, logits) where logits [batch_size, seq_len, vocab_size]
         """
         logits = self.bert(input_ids)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=0)
+        loss = F.nll_loss(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=0)
         return loss, logits
 
     def encode(self, input_ids):

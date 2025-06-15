@@ -42,26 +42,52 @@ class AsmTokenizer:
 		print(f"Vocab loaded from {filepath}")
 
 	def tokenize(self, text):
+		# Use a more concise regular expression
+		token_pattern = r"""
+			\<[A-Za-z]+:[A-Za-z0-9_]+(?::\w+)?\> |  # <TYPE:value> or <TYPE:subtype:value>
+			\<[A-Z]+\> |                            # All uppercase label <TARGET>
+			\[[^\]]+\] |                            # Complete memory expression
+			[A-Za-z0-9_]+:[A-Za-z0-9_]+ |           # category:opcode
+			[\[\],:;*+./-] |                        # Single special character
+			[\w]+                                   # Regular word characters
+		"""
+		tokens = re.findall(token_pattern, text, re.VERBOSE)
+		tokens = [token.strip() for token in tokens if token.strip()]
+		return self.expand_tokens(tokens)
 
-		# Custom regex-based tokenization for assembly
-		tokens = re.findall(r"<[A-Z]+>|[\w]+|[\[\],:;*+./-]", text)
-		return tokens
-		# tokens = re.findall(
-        #     r"<[A-Z]+>|"        # Match special tokens like <PAD>
-        #     r"0x[0-9a-fA-F]+|"   # Hexadecimal numbers
-        #     r"\b\d+\b|"          # Decimal integers (word boundaries prevent partial matches)
-        #     r"[\w']+|"           # Identifiers (allows apostrophes for MMX registers)
-        #     r"[!@#$%^&*()_+={}\[\]:;|<>,.?/~`-]"  # Special symbols
-		# 	, text)
-		# processed_tokens = []
-		# for token in tokens:
-        #     # Check if it is a hexadecimal or decimal constant
-		# 	if re.match(r"0x[0-9a-fA-F]+", token) or re.match(r"[-+]?\b\d+\b", token):
-		# 		processed_tokens.append("<const>")
-		# 	else:
-		# 		processed_tokens.append(token)
-		# return processed_tokens
-	
+	def expand_tokens(self, tokens):
+		expanded = []
+		for token in tokens:
+			# Split opcode category
+			# Handle memory expression
+			if token.startswith('[') and token.endswith(']'):
+				expanded.extend(self.expand_memory(token))
+			elif ':' in token and not token.startswith('<'):
+				parts = token.split(':')
+				expanded.append(parts[0])  # category part
+				expanded.append(':')       # add separator
+				expanded.append(parts[1])  # opcode part
+			else:
+				expanded.append(token)
+		return expanded
+
+	def expand_memory(self, token):
+		if token.startswith('[') and token.endswith(']'):
+			# Decompose memory expression
+			expanded = []
+			inner = token[1:-1]
+			if inner:
+				expanded.append('[')
+				# Split by + but keep the operator
+				parts = re.split(r'(\+)', inner)
+				expanded.extend([p for p in parts if p])
+				expanded.append(']')
+			else:
+				expanded = token
+		else:
+			expanded = token
+		return expanded
+
 	def encode(self, text):
 		tokens = self.tokenize(text)
 		return [self.vocab.get(tok, self.vocab["<UNK>"]) for tok in tokens]

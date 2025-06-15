@@ -51,7 +51,7 @@ class BERTTrainer:
         # Using Negative Log Likelihood Loss function for predicting the masked_token
         # self.criterion = torch.nn.NLLLoss(ignore_index=0)
         self.log_freq = log_freq
-        self.avg_loss = 999999
+        self.avg_loss = float('inf')
         self.model_save_path = model_save_path
         self.use_amp = use_amp
         if use_amp:
@@ -156,7 +156,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Command line parameters")
     parser.add_argument("--device", default="cuda", dest="device")
     parser.add_argument("--epochs", type=int, default=20, dest="epochs")
-    parser.add_argument("--batch_size", type=int, default=256, dest="batch_size")
+    parser.add_argument("--batch_size", type=int, default=10, dest="batch_size")
     args = parser.parse_args()
     seq_len = 128
     data_dir = "."
@@ -245,7 +245,7 @@ if __name__ == "__main__":
         model_save_path=os.path.join(data_dir, "outputs", f"anp-model.pth"),
         device=args.device,
     )
-
+    best_loss = float('inf')
     # Training loop - alternate training tasks
     for epoch in range(args.epochs):
         print(f"\n=== Epoch {epoch+1}/{args.epochs} === [MLM Task]")
@@ -253,9 +253,11 @@ if __name__ == "__main__":
         
         print(f"\n=== Epoch {epoch+1}/{args.epochs} === [ANP Task]")
         anp_train_loss, anp_valid_loss = anp_trainer.train(epoch)
-        
-        # Save combined model (including both tasks)
-        torch.save(bert_model.state_dict(), os.path.join(data_dir, "outputs", f"combined-model-epoch{epoch}.pth"))
-        print(f"Saved combined model for epoch {epoch+1}")
+        loss = mlm_valid_loss + anp_valid_loss
+        if loss < best_loss:
+            best_loss = loss
+            # Save the best model after each epoch
+            torch.save(bert_model.state_dict(), os.path.join(data_dir, "outputs", f"best-model-epoch.pth"))
+            print(f"Saved best model for epoch {epoch+1} with loss: {best_loss:.4f}")
     
     print("Training completed!")

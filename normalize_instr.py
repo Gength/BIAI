@@ -3,128 +3,189 @@ import os
 import pickle
 import re
 from scipy.sparse import lil_matrix
-def filter_near(op):
-    return '<NEAR>'
+import json
 
-def filter_far(op):
-    return '<FAR>'
+with open("opcode_categories.json", "r") as f:
+    OPCODE_CATEGORIES = json.load(f)
+with open("register_types.json", "r") as f:
+    REGISTER_TYPES = json.load(f)
 
-def filter_void(op):
-    return '<VOID>'
-
-def filter_special(op):
-    return '<SPECIAL>'
-
-def filter_reg(op):
-    return op
-
-def filter_disp_in_displacement(displacement):
-    if displacement > 0:
-        return '<POSITIVE>'
-    elif displacement < 0:
-        return '<NEGATIVE>'
-    else:
-        return '<ZERO>'
-
-def unsigned2signed(number, width):
-    if number > 2**(width-1) - 1:
-        number = number - 2**width
-    return number
-
-def normalize_instruction_assembly_code(instruction, arch_bits):
+def normalize_instruction_assembly_code(instruction, arch_bits, Unknown=None):
     """
-    兼容angr/capstone的归一化函数
-    :param instruction: capstone指令对象
-    :param arch_bits: 架构位宽 (32 or 64)
+    Compatible normalization function for angr/capstone.
+    :param instruction: capstone instruction object
+    :param arch_bits: architecture bit width (32 or 64)
     """
-    cpu_width = arch_bits  # 使用实际架构位宽
+    # Get mnemonic and convert to lowercase
+    inst = instruction.mnemonic.lower()
     
-    # 获取助记符
-    inst = instruction.mnemonic
+    # Lookup opcode category
+    opcode_category = "unknown"
+    for prefix, category in OPCODE_CATEGORIES.items():
+        if inst.startswith(prefix):
+            opcode_category = category
+            break
     
-    # 跳转/调用指令列表
-    jump_mnemonics = {
-        'jmp', 'je', 'jne', 'jz', 'jnz', 'jb', 'jbe', 'ja', 'jae', 
-        'jl', 'jle', 'jg', 'jge', 'jo', 'jno', 'js', 'jns', 'jp', 
-        'jnp', 'jecxz', 'jrcxz', 'loop', 'loope', 'loopne', 'call'
-    }
+    if opcode_category == "unknown":
+        if Unknown is not None and inst not in Unknown['unkown_opcode']:
+            print(f"Warning: Unknown Opcode '{inst}', using 'unknown' category.")
+            Unknown['unkown_opcode'].add(inst)
     
-    # 处理每个操作数
+    normalized_inst = f"{opcode_category}:{inst}"
+    
+    # Process each operand
     operands = []
     for i, op in enumerate(instruction.operands):
-        # 寄存器操作数
+        # Register operand
         if op.type == 1:  # CS_OP_REG
-            reg_name = instruction.reg_name(op.reg)
-            operands.append(filter_reg(reg_name))
+            reg_name = instruction.reg_name(op.reg).lower()
+            reg_type = REGISTER_TYPES.get(reg_name, "unknown")
             
-        # 立即数操作数
-        elif op.type == 2:  # CS_OP_IMM
-            # 跳转指令特殊处理
-            if instruction.mnemonic in jump_mnemonics:
-                operands.append(filter_near(op))
-            else:
-                imm = op.imm
-                # 处理负数的补码表示
-                if imm < 0:
-                    imm = (1 << cpu_width) + imm
+            if reg_type == "unknown":
+                # Infer type based on architecture bit width and register name
+                if arch_bits == 32:
+                    # 32-bit architecture register handling
+                    if reg_name.startswith('e'):
+                        reg_type = 'gpr'  # 32-bit general purpose register (eax, ebx, etc.)
+                    elif reg_name in ['ax', 'bx', 'cx', 'dx']:
+                        reg_type = 'gpr16'  # 16-bit general purpose register
+                    elif reg_name in ['ah', 'al', 'bh', 'bl']:
+                        reg_type = 'gpr8'   # 8-bit general purpose register
+                    else:
+                        reg_type = 'gpr'    # Default as general purpose register
+                else:  # 64-bit architecture
+                    if reg_name.startswith('r') and reg_name[1:].isdigit():
+                        reg_type = 'gpr'   # 64-bit general purpose register (r8-r15)
+                    elif reg_name.startswith('r'):
+                        reg_type = 'gpr64' # Traditional 64-bit registers (rax, rbx, etc.)
+                    elif reg_name in ['eax', 'ebx']:
+                        reg_type = 'gpr32' # 32-bit mode registers
+                    else:
+                        reg_type = 'gpr'   # Default as general purpose register
                 
-                if unsigned2signed(imm, cpu_width) > 0:
-                    operands.append('<POSITIVE>')
-                elif unsigned2signed(imm, cpu_width) < 0:
-                    operands.append('<NEGATIVE>')
+                # Update register type mapping to avoid future warnings
+                REGISTER_TYPES[reg_name] = reg_type
+            
+            operands.append(f"<REG:{reg_type}>")
+            
+        # Immediate operand
+        elif op.type == 2:  # CS_OP_IMM:
+            # Determine max bits based on architecture
+            max_bits = 32 if arch_bits == 32 else 64
+            
+            # Special handling for jump instructions
+            jump_mnemonics = {'jmp', 'je', 'jne', 'call', 'ja', 'jb', 'jae', 'jbe', 'jg', 'jge', 'jl', 'jle'}
+            if instruction.mnemonic.lower() in jump_mnemonics:
+                operands.append("<TARGET>")
+            else:
+                abs_imm = abs(op.imm)
+                
+                # Classify immediate value based on architecture and size
+                if abs_imm == 0:
+                    operands.append("<IMM:zero>")
+                elif abs_imm < 2**8:
+                    operands.append("<IMM:8bit>")
+                elif abs_imm < 2**16:
+                    operands.append("<IMM:16bit>")
+                elif abs_imm < 2**32:
+                    operands.append("<IMM:32bit>")
+                elif arch_bits == 64 and abs_imm < 2**64:
+                    operands.append("<IMM:64bit>")
                 else:
-                    operands.append('<ZERO>')
+                    # Special case handling
+                    operands.append("<IMM:oversized>")
                     
-        # 内存操作数
+        # Memory operand (consider architecture bit width)
         elif op.type == 3:  # CS_OP_MEM
             mem = op.mem
-            parts = []
+            mem_parts = []
             
-            # 基址寄存器
+            # Base register
             if mem.base != 0:
-                parts.append(instruction.reg_name(mem.base))
+                base_reg = instruction.reg_name(mem.base).lower()
+                base_type = REGISTER_TYPES.get(base_reg, "unknown")
+                if base_type == "unknown":
+                    # Infer based on architecture
+                    if arch_bits == 32 and base_reg.startswith('e'):
+                        base_type = "gpr"
+                    elif arch_bits == 64 and (base_reg.startswith('r') or base_reg in ['rax', 'rbx']):
+                        base_type = "gpr"
+                    else:
+                        base_type = "gpr"  # Default as general purpose register
+                mem_parts.append(f"<BASE:{base_type}>")
             
-            # 索引寄存器
+            # Index register
             if mem.index != 0:
-                index_part = instruction.reg_name(mem.index)
-                if mem.scale > 1:
-                    index_part += f"*{mem.scale}"
-                parts.append(index_part)
+                index_reg = instruction.reg_name(mem.index).lower()
+                index_type = REGISTER_TYPES.get(index_reg, "unknown")
+                if index_type == "unknown":
+                    # Infer based on architecture
+                    if arch_bits == 32 and index_reg.startswith('e'):
+                        index_type = "gpr"
+                    elif arch_bits == 64 and (index_reg.startswith('r') or index_reg in ['rax', 'rbx']):
+                        index_type = "gpr"
+                    else:
+                        index_type = "gpr"  # Default as general purpose register
+                scale = mem.scale
+                mem_parts.append(f"<INDEX:{index_type}:{scale}>")
             
-            # 位移值
-            disp_str = filter_disp_in_displacement(mem.disp)
-            if mem.disp != 0 or not parts:  # 只有位移或位移+寄存器
-                parts.append(disp_str)
+            # Displacement value classification (consider architecture)
+            if mem.disp != 0:
+                abs_disp = abs(mem.disp)
+                # Adjust classification thresholds based on architecture
+                if arch_bits == 32:
+                    if abs_disp < 2**8:
+                        mem_parts.append("<DISP:small>")
+                    elif abs_disp < 2**16:
+                        mem_parts.append("<DISP:medium>")
+                    else:
+                        mem_parts.append("<DISP:large>")
+                else:  # 64-bit
+                    if abs_disp < 2**8:
+                        mem_parts.append("<DISP:small>")
+                    elif abs_disp < 2**16:
+                        mem_parts.append("<DISP:medium>")
+                    elif abs_disp < 2**32:
+                        mem_parts.append("<DISP:large>")
+                    else:
+                        mem_parts.append("<DISP:huge>")
             
-            operands.append(f"[{'+'.join(parts)}]")
+            # Special handling for cases without base/index
+            if not mem_parts:
+                mem_parts.append("<ABS_MEM>")
             
-        # 其他类型操作数
+            operands.append("[" + "+".join(mem_parts) + "]")
+            
+        # Other operand types
         else:
-            operands.append(f'<UNSUPPORTED_OP:{op.type}>')
+            operands.append("<UNK_OP>")
+            if Unknown is not None and op.type not in Unknown['unknown_operand']:
+                print(f"Warning: Unknown Operand Type '{op.type}', using 'unknown_operand' type.")
+                Unknown['unknown_operand'].add(op.type)
     
-    # 拼接操作数
+    # Build normalized instruction
     if operands:
-        inst += ' ' + ', '.join(operands)
+        normalized_inst += " " + ", ".join(operands)
     
-    return inst
+    return normalized_inst
 
 import angr
 import capstone
 
 def disassemble_function(binary_path, function_address=None, function_name=None):
     """
-    使用 angr 反汇编二进制文件中的函数
-    :param binary_path: 二进制文件路径
-    :param function_address: 目标函数地址(十六进制)
-    :param function_name: 目标函数名
+    Disassemble a function in a binary file using angr.
+    :param binary_path: Path to the binary file
+    :param function_address: Target function address (hexadecimal)
+    :param function_name: Target function name
     """
-    # 加载二进制文件
+    # Load the binary file
     project = angr.Project(binary_path, auto_load_libs=False)
     
-    # 构建控制流图(CFG)
+    # Build the Control Flow Graph (CFG)
     cfg = project.analyses.CFGFast()
     
-    # 获取目标函数
+    # Get the target function
     target_func = None
     if function_address:
         target_func = cfg.functions.get(int(function_address, 16))
@@ -135,32 +196,34 @@ def disassemble_function(binary_path, function_address=None, function_name=None)
                 break
     
     if not target_func:
-        print("[-] 未找到目标函数")
+        print("[-] Target function not found")
         return
     
-    print(f"[+] 找到目标函数: {target_func.name} @ 0x{target_func.addr:x}")
-    print(f"    函数大小: {target_func.size} 字节")
-    print(f"    基本块数量: {len(target_func.block_addrs_set)}")
+    print(f"[+] Found target function: {target_func.name} @ 0x{target_func.addr:x}")
+    print(f"    Function size: {target_func.size} bytes")
+    print(f"    Number of basic blocks: {len(target_func.block_addrs_set)}")
     
-    # 获取函数的汇编代码
-    print("\n======= 汇编代码 (原始 => 归一化) =======")
+
+    # get assembly code for the function
+    print("\n======= assembly code (original => normalized) =======")
     
-    # 按地址排序基本块
+
+    # sort the basic blocks by their address
     blocks = sorted(target_func.blocks, key=lambda b: b.addr)
     
     for block in blocks:
-        print(f"\n; 基本块 0x{block.addr:x} - 0x{block.addr + block.size:x}")
+        print(f"\n; basic block 0x{block.addr:x} - 0x{block.addr + block.size:x}")
         
-        # 反汇编基本块中的每条指令
+        # disassemble each instruction in the block
         capstone = project.arch.capstone
         for instruction in capstone.disasm(block.bytes, block.addr):
-            # 原始指令
+            # original instruction 
             address = f"0x{instruction.address:x}"
             mnemonic = instruction.mnemonic
             op_str = instruction.op_str
             raw_inst = f"{mnemonic} {op_str}" if op_str else mnemonic
             
-            # 归一化指令
+            # normalized instruction
             normalized = normalize_instruction_assembly_code(
                 instruction, 
                 project.arch.bits
@@ -168,286 +231,80 @@ def disassemble_function(binary_path, function_address=None, function_name=None)
             
             print(f"{address}: {raw_inst.ljust(30)} => {normalized}")
 
-
-
-
-
-def normalize_instruction(inst_str):
-    """
-    归一化单条汇编指令
-    :param inst_str: 汇编指令字符串
-    :return: 归一化后的指令字符串
-    """
-    CPU_WIDTH = 64  # 假设使用64位架构
-    def unsigned2signed(number, width):
-        """将无符号数转换为有符号数"""
-        if number >= 2**(width-1):
-            return number - 2**width
-        return number
-    # 指令前缀列表
-    prefixes = {
-        'lock', 'rep', 'repe', 'repne', 'repz', 'repnz', 
-        'bnd', 'xacquire', 'xrelease', 'notrack'
-    }
-    
-    # 首先将整个指令按空格分割成令牌
-    tokens = inst_str.split()
-    if not tokens:
-        return ""
-    
-    # 处理指令前缀和主操作码
-    prefix_parts = []
-    mnemonic = None
-    operand_tokens = []
-    
-    # 收集所有前缀
-    i = 0
-    while i < len(tokens) and tokens[i].lower() in prefixes:
-        prefix_parts.append(tokens[i])
-        i += 1
-    
-    # 下一个令牌是主操作码
-    if i < len(tokens):
-        mnemonic = tokens[i]
-        i += 1
-    
-    # 剩余的是操作数部分
-    operand_tokens = tokens[i:]
-    
-    # 构建完整助记符（前缀 + 主指令）
-    if prefix_parts and mnemonic:
-        full_mnemonic = " ".join(prefix_parts + [mnemonic]).lower()
-    elif mnemonic:
-        full_mnemonic = mnemonic.lower()
-    else:
-        full_mnemonic = " ".join(prefix_parts).lower()
-    
-    # 如果没有操作数，直接返回
-    if not operand_tokens:
-        return full_mnemonic
-    
-    # 将操作数令牌组合回字符串（保留原始格式）
-    operands_str = " ".join(operand_tokens)
-    operands = [op.strip() for op in operands_str.split(',')]
-    normalized_ops = []
-    
-    # 跳转指令列表（包括带前缀的变体）
-    jump_mnemonics = {
-        'jmp', 'je', 'jne', 'jz', 'jnz', 'jb', 'jbe', 'ja', 'jae', 
-        'jl', 'jle', 'jg', 'jge', 'jo', 'jno', 'js', 'jns', 'jp', 
-        'jnp', 'jecxz', 'jrcxz', 'loop', 'loope', 'loopne', 'call'
-    }
-    
-    # 寄存器列表（x86_64）
-    registers = {
-        # 64位
-        'rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi', 'rbp', 'rsp', 
-        'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15',
-        # 32位
-        'eax', 'ebx', 'ecx', 'edx', 'esi', 'edi', 'ebp', 'esp',
-        # 16位
-        'ax', 'bx', 'cx', 'dx', 'si', 'di', 'bp', 'sp',
-        # 8位
-        'al', 'bl', 'cl', 'dl', 'sil', 'dil', 'bpl', 'spl',
-        'ah', 'bh', 'ch', 'dh'
-    }
-    
-    for op in operands:
-        # 处理内存操作数 (如 "qword ptr [rbp - 8]")
-        if 'ptr' in op or '[' in op:
-            # 提取方括号内的表达式
-            start = op.find('[')
-            end = op.find(']')
-            if start != -1 and end != -1:
-                expr = op[start+1:end].strip()
-                
-                # 分割表达式中的组件
-                components = expr.replace('+', ' + ').replace('-', ' - ').split()
-                normalized_components = []
-                sign = 1
-                
-                # 处理每个组件
-                for comp in components:
-                    comp = comp.strip()
-                    if comp == '+':
-                        sign = 1
-                        continue
-                    elif comp == '-':
-                        sign = -1
-                        continue
-                    
-                    # 寄存器组件
-                    if comp.lower() in registers:
-                        normalized_components.append(comp)
-                    # 数值组件
-                    else:
-                        try:
-                            # 处理带符号的数值
-                            if comp.startswith('-0x'):
-                                num = -int(comp[3:], 16)
-                            elif comp.startswith('+0x'):
-                                num = int(comp[3:], 16)
-                            elif comp.startswith('0x'):
-                                num = int(comp[2:], 16)
-                            elif comp.endswith('h'):
-                                # 处理带符号的后缀格式
-                                if comp[0] == '-':
-                                    num = -int(comp[1:-1], 16)
-                                elif comp[0] == '+':
-                                    num = int(comp[1:-1], 16)
-                                else:
-                                    num = int(comp[:-1], 16)
-                            else:
-                                # 尝试解析为整数（可能带符号）
-                                num = int(comp)
-                            
-                            # 归一化位移值
-                            signed_num = unsigned2signed(sign * abs(num), CPU_WIDTH)
-                            if signed_num > 0:
-                                normalized_components.append('<POSITIVE>')
-                            elif signed_num < 0:
-                                normalized_components.append('<NEGATIVE>')
-                            else:
-                                normalized_components.append('<ZERO>')
-                        except:
-                            normalized_components.append(comp)
-                
-                # 重新构建内存表达式
-                normalized_mem = '[' + '+'.join(normalized_components) + ']'
-                normalized_ops.append(normalized_mem)
-            else:
-                normalized_ops.append('<MEM>')
-        
-        # 处理跳转目标 - 检查实际指令（不带前缀）是否为跳转指令
-        elif mnemonic and mnemonic.lower() in jump_mnemonics:
-            normalized_ops.append('<NEAR>')
-        
-        # 处理立即数（包括负数）
-        else:
-            try:
-                # 处理带符号的十六进制格式
-                if op.startswith('-0x'):
-                    num = -int(op[3:], 16)
-                elif op.startswith('+0x'):
-                    num = int(op[3:], 16)
-                elif op.startswith('0x'):
-                    num = int(op[2:], 16)
-                elif op.endswith('h'):
-                    # 处理带符号的后缀格式
-                    if op[0] == '-':
-                        num = -int(op[1:-1], 16)
-                    elif op[0] == '+':
-                        num = int(op[1:-1], 16)
-                    else:
-                        num = int(op[:-1], 16)
-                else:
-                    # 尝试解析为整数（可能带符号）
-                    num = int(op)
-                
-                # 归一化立即数
-                signed_num = unsigned2signed(num, CPU_WIDTH)
-                if signed_num > 0:
-                    normalized_ops.append('<POSITIVE>')
-                elif signed_num < 0:
-                    normalized_ops.append('<NEGATIVE>')
-                else:
-                    normalized_ops.append('<ZERO>')
-            except:
-                # 不是数值，检查是否是寄存器
-                if op.lower() in registers:
-                    normalized_ops.append(op)
-                else:
-                    normalized_ops.append(op)
-    
-    # 构建归一化后的指令
-    normalized_inst = full_mnemonic
-    if normalized_ops:
-        normalized_inst += ' ' + ', '.join(normalized_ops)
-    
-    return normalized_inst
-
-def load_assembly_data(data):
-    data_pairs = []
-    for item in data:
-        if item[0].startswith('0x'):
-            temp = []
-            for datum in item:
-                instr=str.split(datum, '\t')[1:]
-                instr = ' '.join(instr)
-                temp.append(instr)
-            item = temp
-        normalized = [normalize_instruction(inst) for inst in item]
-        if len(normalized) % 2 != 0:
-            normalized.append('nop')
-        for i in range(0, len(normalized)-1, 2):
-            # Skip if either instruction is empty after normalization
-            
-                # Ensure both instructions are not empty
-            data_pairs.append((normalized[i].strip(), normalized[i+1].strip()))
-    return data_pairs
-
 def process_binary_file(args):
-        binary_path, save_path = args
-        binary_name = os.path.split(binary_path)[-1]
-        try:
-            results = dict()
-            proj = angr.Project(binary_path, auto_load_libs=False)
-            cfg = proj.analyses.CFGFast()
+    Unknown = {
+        "unkown_opcode": set(),
+        "unknown_reg": set(),
+        "unknown_operand": set()
+    }
+    binary_path, save_path = args
+    binary_name = os.path.split(binary_path)[-1]
+    try:
+        results = dict()
+        proj = angr.Project(binary_path, auto_load_libs=False)
+        cfg = proj.analyses.CFGFast()
+        
+        for addr, func in cfg.functions.items():
+            if func.name in ['UnresolvableCallTarget', 'UnresolvableJumpTarget']:
+                continue
+            # First, check the number of basic blocks
+            blocks = list(func.blocks)
+            n_blocks = len(blocks)
+            if n_blocks <= 5:
+                continue
             
-            for addr, func in cfg.functions.items():
-                if func.name in ['UnresolvableCallTarget', 'UnresolvableJumpTarget']:
-                    continue
-                # 先检查基本块数量
-                blocks = list(func.blocks)
-                n_blocks = len(blocks)
-                if n_blocks <= 5:
-                    continue
-                
-                # 初始化函数条目
-                if func.name not in results:
-                    results[func.name] = dict()
+            # Initialize function entry
+            if func.name not in results:
+                results[func.name] = dict()
 
-                # 创建地址到索引的映射
-                # 按地址排序基本块以确保一致的索引顺序
-                sorted_blocks = sorted(blocks, key=lambda b: b.addr)
-                block_addrs = [block.addr for block in sorted_blocks]
-                addr_to_idx = {addr: idx for idx, addr in enumerate(block_addrs)}
-                # 保存地址到索引的映射
-                results[func.name]['addr_to_idx'] = addr_to_idx
-                # 初始化邻接矩阵
-                adj_matrix = lil_matrix((n_blocks, n_blocks), dtype=int)
+            # Create address-to-index mapping
+            # Sort basic blocks by address to ensure consistent index order
+            sorted_blocks = sorted(blocks, key=lambda b: b.addr)
+            block_addrs = [block.addr for block in sorted_blocks]
+            addr_to_idx = {addr: idx for idx, addr in enumerate(block_addrs)}
+            # Save address-to-index mapping
+            results[func.name]['addr_to_idx'] = addr_to_idx
+            # Initialize adjacency matrix
+            adj_matrix = lil_matrix((n_blocks, n_blocks), dtype=int)
 
-                for block in sorted_blocks:
-                    # 生成邻接矩阵
-                    node = cfg.model.get_any_node(block.addr)
-                    succ = getattr(node, 'successors', [])
-                    for succ_node in succ:
-                        if succ_node.addr in block_addrs:
-                            src_idx = addr_to_idx[block.addr]
-                            dest_idx = addr_to_idx[succ_node.addr]
-                            adj_matrix[src_idx, dest_idx] = 1
+            for block in sorted_blocks:
+                # Generate adjacency matrix
+                node = cfg.model.get_any_node(block.addr)
+                succ = getattr(node, 'successors', [])
+                for succ_node in succ:
+                    if succ_node.addr in block_addrs:
+                        src_idx = addr_to_idx[block.addr]
+                        dest_idx = addr_to_idx[succ_node.addr]
+                        adj_matrix[src_idx, dest_idx] = 1
 
-                    results[func.name][block.addr] = []
-                    # 归一化指令
-                    for insn in block.capstone.insns:
-                        normalized_insn = normalize_instruction_assembly_code(
-                            insn, 
-                            proj.arch.bits
-                        )
-                        results[func.name][block.addr].append(normalized_insn)
-                # 将稀疏矩阵转换为可序列化的格式（如COO格式）
-                results[func.name]['adjacency_matrix'] = adj_matrix.tocoo()
+                results[func.name][block.addr] = []
+                # Normalize instructions
+                for insn in block.capstone.insns:
+                    normalized_insn = normalize_instruction_assembly_code(
+                        insn, 
+                        proj.arch.bits,
+                        Unknown=Unknown
+                    )
+                    results[func.name][block.addr].append(normalized_insn)
+            # Convert sparse matrix to a serializable format (such as COO format)
+            results[func.name]['adjacency_matrix'] = adj_matrix.tocoo()
 
-        except Exception as e:
-            print(f"Error processing {binary_name}: {e}")
-        if any(results.values()):
-            with open(os.path.join(save_path, "output_"+binary_name+".pkl"), "wb") as f:
-                pickle.dump(results, f)
-        else:
-            print(f"Warning: No results for {binary_name}, skipping save.")
+    except Exception as e:
+        print(f"Error processing {binary_name}: {e}")
+    if any(results.values()):
+        with open(os.path.join(save_path, "output_"+binary_name+".pkl"), "wb") as f:
+            pickle.dump(results, f)
+    else:
+        print(f"Warning: No results for {binary_name}, skipping save.")
+    return Unknown
 
 from tqdm import tqdm
 if __name__ == "__main__":
+    Unknown = {
+        "unkown_opcode": set(),
+        "unknown_reg": set(),
+        "unknown_operand": set()
+    }
     data_dir = '.'
     binary_folder = os.path.join(data_dir, "Dataset-1")
 
@@ -458,21 +315,36 @@ if __name__ == "__main__":
     tasks = []
     for subfolder in os.listdir(binary_folder):
         subfolder_path = os.path.join(binary_folder, subfolder)
-        # if not os.path.isdir(subfolder_path):
-        #     continue
+        if not os.path.isdir(subfolder_path):
+            continue
         save_path = os.path.join(save_root, subfolder)
         os.makedirs(save_path, exist_ok=True)
         for bin_name in os.listdir(subfolder_path):
             bin_path = os.path.join(subfolder_path, bin_name)
-            if(os.path.isfile(os.path.join(save_path, "output_"+bin_name+".pkl"))):
+            if(os.path.exists(os.path.join(save_path, "output_"+bin_name+".pkl"))):
                 continue
             key_words = re.split('[-_]', bin_name)
             intersection = len(set(key_words) & set(architecture)) > 0 and len(set(key_words) & set(compiler)) > 0
-            # 如果二进制文件名中没有关键字或架构信息，则跳过
+            # Skip if the binary file name does not contain required keywords or architecture information
             if intersection:
                 tasks.append((bin_path, save_path))
+
+
 
     # num_processes = min(multiprocessing.cpu_count(), len(tasks))
     num_processes = 12
     with multiprocessing.Pool(processes=num_processes) as pool:
-        list(tqdm(pool.imap_unordered(process_binary_file, tasks), total=len(tasks)))
+        unknown_list = list(tqdm(pool.imap_unordered(process_binary_file, tasks), total=len(tasks)))
+    # wait for all processes to finish
+    pool.close()
+    pool.join()
+    for unk in unknown_list:
+        Unknown['unkown_opcode'].update(unk.get('unkown_opcode', set()))
+        Unknown['unknown_reg'].update(unk.get('unknown_reg', set()))
+        Unknown['unknown_operand'].update(unk.get('unknown_operand', set()))
+    Unknown['unkown_opcode'] = list(Unknown['unkown_opcode'])
+    Unknown['unknown_reg'] = list(Unknown['unknown_reg'])
+    Unknown['unknown_operand'] = list(Unknown['unknown_operand'])
+    with open(os.path.join(".", "unknown_opcode.json"), "w") as f:
+        # Merging Unknown information from all processes requires separate handling; here, only the main process's Unknown is saved
+        json.dump(Unknown, f, indent=4)

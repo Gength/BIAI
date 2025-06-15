@@ -20,10 +20,14 @@ class BERTMLMDataset(Dataset):
 		output = []
 		labels = []
 		for id in ids:
+			if id == self.tokenizer.vocab['<SEP>']:
+				output.append(id)
+				labels.append(0)
 			if random.random() < 0.15:
-				if random.random() < 0.8:
+				rand_val = random.random()
+				if rand_val < 0.8:
 					output.append(self.tokenizer.vocab['<MASK>'])  # 80% Replace with MASK
-				elif random.random() < 0.9:
+				elif rand_val < 0.9:
 					output.append(random.choice(list(self.tokenizer.vocab.values())))  # 10% Random token
 				else:
 					output.append(id)  # 10% Keep original
@@ -44,10 +48,10 @@ class BERTMLMDataset(Dataset):
 		else:
 			labels = ids.copy()
 
-		# 预留 [CLS] 和 [SEP]，截断原始 tokens
+		# Reserve [CLS] and [SEP], truncate original tokens
 		ids = ids[:self.max_len - 2]
 		labels = labels[:self.max_len - 2]
-		pad_len = self.max_len - len(ids) - 2  # 减去 [CLS] 和 [SEP]
+		pad_len = self.max_len - len(ids) - 2  # minus <CLS> and <SEP>
 		ids = [self.tokenizer.vocab['<CLS>']] + ids + [self.tokenizer.vocab['<SEP>']]
 		labels = [0] + labels + [0]
 
