@@ -10,13 +10,15 @@ from datasets import load_dataset
 from models.dataset import TaskDataset
 from models.collatefn import MLMCollateFn, ANPCollateFn, CombinedCollateFn
 from torch.amp import autocast
-class BERTTrainer:
+
+class BERT2Trainer:
     def __init__(
         self,
         model,
-        train_dataloader,
-        test_dataloader=None,
-        valid_dataloader=None,
+        mlm_train_loader,
+        anp_train_loader,
+        mlm_valid_loader,
+        anp_valid_loader,
         lr=1e-4,
         weight_decay=0.01,
         betas=(0.9, 0.999),
@@ -26,131 +28,203 @@ class BERTTrainer:
         device="cuda",
         use_amp=True,
     ):
-
         self.device = device
         self.model = model.to(device)
-        self.train_data = train_dataloader
-        self.test_data = test_dataloader
-        self.valid_data = valid_dataloader
-
+        self.mlm_train_loader = mlm_train_loader
+        self.anp_train_loader = anp_train_loader
+        self.mlm_valid_loader = mlm_valid_loader
+        self.anp_valid_loader = anp_valid_loader
+        
+        # 单个优化器用于整个模型
         self.optim = Adam(
             self.model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay
         )
+        
+        # 计算总迭代次数
+        total_steps = max(len(mlm_train_loader), len(anp_train_loader)) * num_epochs
+        
+        # 单个学习率调度器
         self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
             self.optim,
             max_lr=1e-3,
-            # steps_per_epoch=train_dataloader.dataset._info.dataset_size
-            # // train_dataloader.batch_size,
-            steps_per_epoch=len(train_dataloader),
-            epochs=num_epochs,
+            total_steps=total_steps,
             pct_start=0.1,
             anneal_strategy="cos",
             final_div_factor=1e2,
         )
 
-        # Using Negative Log Likelihood Loss function for predicting the masked_token
-        # self.criterion = torch.nn.NLLLoss(ignore_index=0)
         self.log_freq = log_freq
-        self.avg_loss = float('inf')
+        self.best_loss = float('inf')
         self.model_save_path = model_save_path
+        self.num_epochs = num_epochs
         self.use_amp = use_amp
         if use_amp:
             self.scaler = torch.amp.GradScaler('cuda')
         print("Total Parameters:", sum([p.nelement() for p in self.model.parameters()]))
 
-    def train(self, epoch):
-        train_loss = self.iteration(epoch, self.train_data, train=True)
-        valid_loss = self.iteration(epoch, self.valid_data, train=False)
-        
-        if valid_loss < self.avg_loss:
-            self.avg_loss = valid_loss
-            torch.save(self.model.state_dict(), self.model_save_path)
-            print(f"Saved best model with validation loss: {valid_loss:.4f}")
-        
-        return train_loss, valid_loss
+    def train(self):
+        for epoch in range(self.num_epochs):
+            # 训练阶段
+            train_loss = self.train_epoch(epoch)
+            
+            # 验证阶段
+            valid_loss = self.validate_epoch(epoch)
+            
+            # 保存最佳模型
+            if valid_loss < self.best_loss:
+                self.best_loss = valid_loss
+                torch.save(self.model.state_dict(), self.model_save_path)
+                print(f"Saved best model with validation loss: {valid_loss:.4f}")
+                
+        print("Training completed!")
 
-    def test(self, epoch):
-        _ = self.iteration(epoch, self.test_data, train=False)
-
-    def iteration(self, epoch, data_loader, train=True):
-        mode = "train" if train else "valid"
+    def train_epoch(self, epoch):
+        self.model.train()
         total_loss = 0.0
         total_batches = 0
-
+        
+        # 创建数据加载器的迭代器
+        mlm_iter = iter(self.mlm_train_loader)
+        anp_iter = iter(self.anp_train_loader)
+        
+        # 确定最大批次数
+        max_batches = max(len(self.mlm_train_loader), len(self.anp_train_loader))
+        
         data_iter = tqdm.tqdm(
-            enumerate(data_loader),
-            desc=f"Epoch {epoch+1} {mode}",
-            total=len(data_loader),
+            range(max_batches),
+            desc=f"Epoch {epoch+1} Train",
+            total=max_batches,
             bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
         )
-
-        for i, data in data_iter:
-            # Skip empty batches
-            if "input_ids" in data and len(data["input_ids"]) == 0:
-                continue
-            if "input_a" in data and len(data["input_a"]) == 0:
-                continue
-                
-            # Prepare task_dict based on task type
-            task_dict = self.prepare_task_dict(data)
+        
+        for i in data_iter:
+            # 清零梯度
+            self.optim.zero_grad()
             
-            if train:
-                self.model.train()
-                self.optim.zero_grad()
+            # 准备MLM任务批次
+            try:
+                mlm_batch = next(mlm_iter)
+            except StopIteration:
+                mlm_iter = iter(self.mlm_train_loader)
+                mlm_batch = next(mlm_iter)
                 
-                # Mixed precision training
-                if self.use_amp:
-                    with autocast('cuda', dtype=torch.float16):
-                        loss, _ = self.model(task_dict)
-                    # Scale the loss and perform backpropagation
-                    self.scaler.scale(loss).backward()
-                    # Unscale gradients and update parameters
-                    self.scaler.step(self.optim)
-                    self.scaler.update()
-                else:
-                    loss, _ = self.model(task_dict)
-                    loss.backward()
-                    self.optim.step()
-                
-                self.optim_schedule.step()
+            # 准备ANP任务批次
+            try:
+                anp_batch = next(anp_iter)
+            except StopIteration:
+                anp_iter = iter(self.anp_train_loader)
+                anp_batch = next(anp_iter)
+            
+            # 计算MLM任务损失并进行反向传播
+            mlm_task_dict = self.prepare_task_dict(mlm_batch)
+            mlm_loss, _ = self.model(mlm_task_dict)
+            
+            # 使用混合精度进行反向传播
+            if self.use_amp:
+                self.scaler.scale(mlm_loss).backward()
             else:
-                self.model.eval()
-                with torch.no_grad():
-                    loss, _ = self.model(task_dict)
-                
-            total_loss += loss.item()
+                mlm_loss.backward()
+            
+            # 计算ANP任务损失并进行反向传播
+            anp_task_dict = self.prepare_task_dict(anp_batch)
+            anp_loss, _ = self.model(anp_task_dict)
+            
+            # 使用混合精度进行反向传播
+            if self.use_amp:
+                self.scaler.scale(anp_loss).backward()
+            else:
+                anp_loss.backward()
+            
+            # 总损失
+            total_batch_loss = mlm_loss.item() + anp_loss.item()
+            
+            # 更新参数（立即更新）
+            if self.use_amp:
+                self.scaler.step(self.optim)
+                self.scaler.update()
+            else:
+                self.optim.step()
+            
+            # 更新学习率
+            self.optim_schedule.step()
+            
+            # 记录损失
+            total_loss += total_batch_loss
             total_batches += 1
             
-            # Update progress bar
-            avg_loss = total_loss / total_batches if total_batches > 0 else 0
-            data_iter.set_postfix(loss=loss.item(), avg_loss=avg_loss)
+            # 更新进度条
+            avg_loss = total_loss / total_batches
+            data_iter.set_postfix(loss=total_batch_loss, avg_loss=avg_loss)
+        
+        avg_epoch_loss = total_loss / total_batches
+        print(f"Epoch {epoch+1} Train loss: {avg_epoch_loss:.4f}")
+        return avg_epoch_loss
+
+    def validate_epoch(self, epoch):
+        self.model.eval()
+        total_loss = 0.0
+        total_batches = 0
+        
+        # 验证MLM任务
+        with torch.no_grad():
+            for mlm_batch in tqdm.tqdm(
+                self.mlm_valid_loader,
+                desc=f"Epoch {epoch+1} Valid (MLM)",
+                leave=False
+            ):
+                if "input_ids" in mlm_batch and len(mlm_batch["input_ids"]) == 0:
+                    continue
+                    
+                mlm_task_dict = self.prepare_task_dict(mlm_batch)
+                mlm_loss, _ = self.model(mlm_task_dict)
+                total_loss += mlm_loss.item()
+                total_batches += 1
+        
+        # 验证ANP任务
+        with torch.no_grad():
+            for anp_batch in tqdm.tqdm(
+                self.anp_valid_loader,
+                desc=f"Epoch {epoch+1} Valid (ANP)",
+                leave=False
+            ):
+                if "input_a" in anp_batch and len(anp_batch["input_a"]) == 0:
+                    continue
+                    
+                anp_task_dict = self.prepare_task_dict(anp_batch)
+                anp_loss, _ = self.model(anp_task_dict)
+                total_loss += anp_loss.item()
+                total_batches += 1
         
         avg_epoch_loss = total_loss / total_batches if total_batches > 0 else float('inf')
-        print(f"Epoch {epoch+1} {mode} loss: {avg_epoch_loss:.4f}")
+        print(f"Epoch {epoch+1} Valid loss: {avg_epoch_loss:.4f}")
         return avg_epoch_loss
-    
+
     def prepare_task_dict(self, data):
-        """
-        Prepare the task dictionary based on the input data.
-        This method is used to handle different task types (MLM, ANP).
-        """
         task_type = data.get("task_type", "mlm")
+        task_dict = {"task_type": task_type}
+        
         if task_type == "mlm":
-            task_dict = {
-                'task_type': 'mlm',
+            task_dict.update({
                 'input_ids': data["input_ids"].to(self.device),
                 'labels': data["labels"].to(self.device)
-            }
+            })
         elif task_type == "anp":
-            task_dict = {
-                'task_type': 'anp',
+            task_dict.update({
                 'input_a': data["input_a"].to(self.device),
                 'input_b': data["input_b"].to(self.device),
                 'labels': data["labels"].to(self.device)
-            }
+            })
         else:
             raise ValueError(f"Unknown task type: {task_type}")
+            
         return task_dict
+
+# Dummy context manager for non-mixed precision training
+class dummy_context:
+    def __enter__(self):
+        return None
+    def __exit__(self, exc_type, exc_value, traceback):
+        pass
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Command line parameters")
@@ -228,36 +302,14 @@ if __name__ == "__main__":
     )
 
     # Create trainers
-    mlm_trainer = BERTTrainer(
-        bert_model,
-        mlm_train_loader,
-        valid_dataloader=mlm_valid_loader,
+    trainer = BERT2Trainer(
+        model=bert_model,
+        mlm_train_loader=mlm_train_loader,
+        anp_train_loader=anp_train_loader,
+        mlm_valid_loader=mlm_valid_loader,
+        anp_valid_loader=anp_valid_loader,
         num_epochs=args.epochs,
-        model_save_path=os.path.join(data_dir, "outputs", f"mlm-model.pth"),
+        model_save_path=os.path.join(data_dir, "outputs", f"best-model.pth"),
         device=args.device,
     )
-    
-    anp_trainer = BERTTrainer(
-        bert_model,
-        anp_train_loader,
-        valid_dataloader=anp_valid_loader,
-        num_epochs=args.epochs,
-        model_save_path=os.path.join(data_dir, "outputs", f"anp-model.pth"),
-        device=args.device,
-    )
-    best_loss = float('inf')
-    # Training loop - alternate training tasks
-    for epoch in range(args.epochs):
-        print(f"\n=== Epoch {epoch+1}/{args.epochs} === [MLM Task]")
-        mlm_train_loss, mlm_valid_loss = mlm_trainer.train(epoch)
-        
-        print(f"\n=== Epoch {epoch+1}/{args.epochs} === [ANP Task]")
-        anp_train_loss, anp_valid_loss = anp_trainer.train(epoch)
-        loss = mlm_valid_loss + anp_valid_loss
-        if loss < best_loss:
-            best_loss = loss
-            # Save the best model after each epoch
-            torch.save(bert_model.state_dict(), os.path.join(data_dir, "outputs", f"best-model-epoch.pth"))
-            print(f"Saved best model for epoch {epoch+1} with loss: {best_loss:.4f}")
-    
-    print("Training completed!")
+    trainer.train()

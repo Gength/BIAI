@@ -3,7 +3,7 @@ import torch
 import random
 from models.dataset import BERTMLMDataset, BERTANPDataset, TaskDataset
 class MLMCollateFn:
-    def __init__(self, tokenizer, seq_len=128, train=True, samples_per_batch=20):
+    def __init__(self, tokenizer, seq_len=128, train=True, samples_per_batch=10):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.train = train
@@ -38,7 +38,7 @@ class MLMCollateFn:
         }
 
 class ANPCollateFn:
-    def __init__(self, tokenizer, seq_len=128, samples_per_batch=20):
+    def __init__(self, tokenizer, seq_len=128, samples_per_batch=10):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.samples_per_batch = samples_per_batch
