@@ -54,7 +54,13 @@ class ANPCollateFn:
             # Only take one sample per graph to avoid data imbalance
             if len(anp_dataset) > 0:
                 n_samples = min(len(anp_dataset), self.samples_per_batch)
-                idx_set = random.sample(range(len(anp_dataset)), n_samples)
+                half = len(anp_dataset) // 2
+                n_first = n_samples // 2
+                n_second = n_samples - n_first
+                idx_first = random.sample(range(half), min(n_first, half))
+                idx_second = random.sample(range(half, len(anp_dataset)), min(n_second, len(anp_dataset) - half))
+                idx_set = idx_first + idx_second
+                random.shuffle(idx_set)
                 for idx in idx_set:
                     ids_a, ids_b, label = anp_dataset[idx]
                     ids_a_output.append(ids_a)

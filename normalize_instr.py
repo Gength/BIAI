@@ -317,17 +317,15 @@ if __name__ == "__main__":
         subfolder_path = os.path.join(binary_folder, subfolder)
         if not os.path.isdir(subfolder_path):
             continue
-        save_path = os.path.join(save_root, subfolder)
-        os.makedirs(save_path, exist_ok=True)
         for bin_name in os.listdir(subfolder_path):
             bin_path = os.path.join(subfolder_path, bin_name)
-            if(os.path.exists(os.path.join(save_path, "output_"+bin_name+".pkl"))):
+            if(os.path.exists(os.path.join(save_root, "output_"+bin_name+".pkl"))):
                 continue
             key_words = re.split('[-_]', bin_name)
             intersection = len(set(key_words) & set(architecture)) > 0 and len(set(key_words) & set(compiler)) > 0
             # Skip if the binary file name does not contain required keywords or architecture information
             if intersection:
-                tasks.append((bin_path, save_path))
+                tasks.append((bin_path, save_root))
 
 
 
