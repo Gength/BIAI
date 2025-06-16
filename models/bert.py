@@ -276,10 +276,10 @@ class BaseBERT(nn.Module):
         self.device = device
         self.seq_len = seq_len
         
-        # 共享的BERT编码器
+        # Shared BERT encoder
         self.bert = BERT(vocab_size, d_model, n_layers, heads, seq_len, dropout, device)
         
-        # MLM任务头
+        # MLM task head
         self.mlm_head = MaskedLanguageModel(d_model, vocab_size)
 
     def forward(self, input_dict):
@@ -343,7 +343,7 @@ class BERT2(BaseBERT):
                  heads=8, seq_len=128, dropout=0.1, device="cuda"):
         super().__init__(vocab_size, d_model, n_layers, heads, seq_len, dropout, device)
         
-        # ANP任务头
+        # ANP task head
         self.anp_head = ANPHead(d_model)
 
     def forward(self, input_dict):
@@ -428,9 +428,9 @@ class BERT4(BERT2):
                  heads=8, seq_len=128, dropout=0.1, device="cuda"):
         super().__init__(vocab_size, d_model, n_layers, heads, seq_len, dropout, device)
         
-        # 添加两个新任务头
-        self.big_head = BIGHead(d_model)  # 块是否在同一图中任务
-        self.gc_head = GraphClassificationHead(d_model, num_classes)  # 图分类任务
+        # Add two new task heads
+        self.big_head = BIGHead(d_model)  # Task: whether blocks are in the same graph
+        self.gc_head = GraphClassificationHead(d_model, num_classes)  # Graph classification task
 
     def forward(self, input_dict):
         """
