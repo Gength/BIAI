@@ -73,9 +73,9 @@ def split_functions():
     # delete items with less than 2 functions
     grouped = {k: v for k, v in grouped.items() if len(v) >= 2}
 
-    for group in grouped.values():
-        # Generate all pairs within the group
-        for a, b in combinations(group, 2):
+    for a_func, a_group in grouped.items():
+        # Generate positive pairs: all pairs within the group
+        for a, b in combinations(a_group, 2):
             pairs.append({
                 "anchor_function_file": a["file_name"],
                 "anchor_function_name": a["function_name"],
@@ -89,29 +89,28 @@ def split_functions():
                 "target_opt": b["opt"],
                 "label": 1  # Positive pair
             })
-        
-    # Generate negative pairs: pick one from this group, 2 from a different group
-    for a in group:
-        for other_func, other_group in grouped.items():
-            if other_func == a["function_name"]:
+        # Generate negative pairs: pick one from this group, one for each other group
+        for b_func, b_group in grouped.items():
+            if a_func == b_func:
                 continue
-            # Pick 2 random items from other_group for negative pair
-            idx_sample = random.sample(range(len(other_group)), 2)
-            for idx in idx_sample:
-                b = other_group[idx]
-                pairs.append({
-                    "anchor_function_file": a["file_name"],
-                    "anchor_function_name": a["function_name"],
-                    "anchor_compiler": a["compiler"],
-                    "anchor_version": a["version"],
-                    "anchor_opt": a["opt"],
-                    "target_function_file": b["file_name"],
-                    "target_function_name": b["function_name"],
-                    "target_compiler": b["compiler"],
-                    "target_version": b["version"],
-                    "target_opt": b["opt"],
-                    "label": 0  # Negative pair
-                })
+            a_idx = random.randint(0, len(a_group) - 1)
+            a = a_group[a_idx]
+            # Randomly sample one function from the other group
+            b_idx = random.randint(0, len(b_group) - 1)
+            b = b_group[b_idx]
+            pairs.append({
+                "anchor_function_file": a["file_name"],
+                "anchor_function_name": a["function_name"],
+                "anchor_compiler": a["compiler"],
+                "anchor_version": a["version"],
+                "anchor_opt": a["opt"],
+                "target_function_file": b["file_name"],
+                "target_function_name": b["function_name"],
+                "target_compiler": b["compiler"],
+                "target_version": b["version"],
+                "target_opt": b["opt"],
+                "label": 0  # Negative pair
+            })
 
     # Step 7: save CSV
     pd.DataFrame(pairs).to_csv(os.path.join(OUTPUT_DIR, "function_pool.csv"), index=False)
