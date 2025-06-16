@@ -6,6 +6,7 @@ from collections import defaultdict
 from sklearn.model_selection import train_test_split
 from models.tokenizer import AsmTokenizer
 from itertools import combinations
+import random
 BASELINE_DIR = os.path.join('.','baseline')
 OUTPUT_DIR = os.path.join('.','outputs')
 
@@ -27,7 +28,7 @@ def split_functions():
         compiler = next((c for c in ["gcc", "clang"] if c in parts), "unknown")
         version = next((v for v in parts if re.match(r"\d+(\.\d+)?", v)), "unknown")
         opt = next((o for o in ["O0", "O1", "O2", "O3", "Os"] if o in parts), "unknown")
-        return compiler, version, opt, bin_name, file_name
+        return compiler, version, opt, file_name
 
     function_list = []
 
@@ -38,9 +39,9 @@ def split_functions():
                 data = pickle.load(f)
         except:
             continue
-        compiler, version, opt, bin_name, file_name = parse_bin_info(file_path)
+        compiler, version, opt, file_name = parse_bin_info(file_path)
         for func_name in data.keys():
-            entry = (func_name, compiler, version, opt, bin_name, file_name)
+            entry = (func_name, compiler, version, opt, file_name)
             function_list.append(entry)
 
     # Step 4: split into train/val/test (function-level split)
@@ -61,38 +62,62 @@ def split_functions():
             "compiler": comp,
             "version": ver,
             "opt": opt,
-            "bin_name": bin_name,
             "file_name": file_name
         }
-        for fn, comp, ver, opt, bin_name, file_name in test
+        for fn, comp, ver, opt, file_name in test
     ]
     # Group by (function_name)
     grouped = defaultdict(list)
     for item in test_dicts:
         grouped[item["function_name"]].append(item)
+    # delete items with less than 2 functions
+    grouped = {k: v for k, v in grouped.items() if len(v) >= 2}
 
     for group in grouped.values():
-        for i in range(len(group)):
-            for j in range(i + 1, len(group)):
-                a, b = group[i], group[j]
+        # Generate all pairs within the group
+        for a, b in combinations(group, 2):
+            pairs.append({
+                "anchor_function_file": a["file_name"],
+                "anchor_function_name": a["function_name"],
+                "anchor_compiler": a["compiler"],
+                "anchor_version": a["version"],
+                "anchor_opt": a["opt"],
+                "target_function_file": b["file_name"],
+                "target_function_name": b["function_name"],
+                "target_compiler": b["compiler"],
+                "target_version": b["version"],
+                "target_opt": b["opt"],
+                "label": 1  # Positive pair
+            })
+        
+    # Generate negative pairs: pick one from this group, 2 from a different group
+    for a in group:
+        for other_func, other_group in grouped.items():
+            if other_func == a["function_name"]:
+                continue
+            # Pick 2 random items from other_group for negative pair
+            idx_sample = random.sample(range(len(other_group)), 2)
+            for idx in idx_sample:
+                b = other_group[idx]
                 pairs.append({
-                    "anchor_function_bin": a["bin_name"],
+                    "anchor_function_file": a["file_name"],
                     "anchor_function_name": a["function_name"],
                     "anchor_compiler": a["compiler"],
                     "anchor_version": a["version"],
                     "anchor_opt": a["opt"],
-                    "target_function_bin": b["bin_name"],
+                    "target_function_file": b["file_name"],
                     "target_function_name": b["function_name"],
                     "target_compiler": b["compiler"],
                     "target_version": b["version"],
-                    "target_opt": b["opt"]
+                    "target_opt": b["opt"],
+                    "label": 0  # Negative pair
                 })
 
     # Step 7: save CSV
     pd.DataFrame(pairs).to_csv(os.path.join(OUTPUT_DIR, "function_pool.csv"), index=False)
 
 import json
-# 定义处理单个split的函数
+# Define the function to process a single split
 def process_split_datasets(split):
     if split == "test":
         function_name_idx_map = {}
@@ -102,9 +127,9 @@ def process_split_datasets(split):
         os.remove(output_path)
     with open(os.path.join(OUTPUT_DIR, f"baseline-{split}-functions.pkl"), "rb") as f:
         data = pickle.load(f)
-    df = pd.DataFrame(data, columns=['function_name', 'compiler', 'version', 'opt', 'bin_name', 'file_name'])
-    for name, group in df.groupby('file_name'):
-        load_path = os.path.join(BASELINE_DIR, 'output_'+name+'.pkl')
+    df = pd.DataFrame(data, columns=['function_name', 'compiler', 'version', 'opt', 'file_name'])
+    for file_name, group in df.groupby('file_name'):
+        load_path = os.path.join(BASELINE_DIR, 'output_'+file_name+'.pkl')
         with open(load_path, "rb") as f:
             binary_data = pickle.load(f)
         
@@ -114,11 +139,10 @@ def process_split_datasets(split):
                 compiler = row.compiler
                 version = row.version
                 opt = row.opt
-                bin_name = row.bin_name
                 function_data = binary_data[function_name]
                 addr_to_idx = function_data['addr_to_idx']
                 output_obj = {}
-                # 只保留整数类型的键
+                # Only keep keys of integer type
                 block_addr = [k for k in addr_to_idx.keys()]
                 block_addr = sorted(block_addr, key=lambda x: addr_to_idx[x])
                 instruction_blocks = []
@@ -138,7 +162,7 @@ def process_split_datasets(split):
                 if split != "test":
                     out_file.write(json.dumps(output_obj, ensure_ascii=False) + '\n')
                 else:
-                    key = (function_name, compiler, version, opt, bin_name)
+                    key = (function_name, compiler, version, opt, file_name)
                     function_name_idx_map[key] = count
                     count += 1
                     out_file.write(json.dumps(output_obj, ensure_ascii=False) + '\n')
