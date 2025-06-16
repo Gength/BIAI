@@ -9,7 +9,7 @@ from models.tokenizer import AsmTokenizer
 from datasets import load_dataset
 from models.dataset import TaskDataset
 from models.collatefn import MLMCollateFn, ANPCollateFn, CombinedCollateFn
-from torch.amp import autocast
+import wandb
 
 class BERT2Trainer:
     def __init__(
@@ -35,15 +35,15 @@ class BERT2Trainer:
         self.mlm_valid_loader = mlm_valid_loader
         self.anp_valid_loader = anp_valid_loader
         
-        # 单个优化器用于整个模型
+        # Single optimizer for the whole model
         self.optim = Adam(
             self.model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay
         )
         
-        # 计算总迭代次数
+        # Calculate total number of iterations
         total_steps = max(len(mlm_train_loader), len(anp_train_loader)) * num_epochs
         
-        # 单个学习率调度器
+        # Single learning rate scheduler
         self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
             self.optim,
             max_lr=1e-3,
@@ -61,33 +61,52 @@ class BERT2Trainer:
         if use_amp:
             self.scaler = torch.amp.GradScaler('cuda')
         print("Total Parameters:", sum([p.nelement() for p in self.model.parameters()]))
+        
+        # Initialize wandb
+        wandb.init(project="bert2-training", config={
+            "learning_rate": lr,
+            "weight_decay": weight_decay,
+            "batch_size": mlm_train_loader.batch_size,
+            "epochs": num_epochs,
+            "device": device
+        })
+        wandb.watch(self.model)  # Monitor model parameters
 
     def train(self):
         for epoch in range(self.num_epochs):
-            # 训练阶段
+            # Training phase
             train_loss = self.train_epoch(epoch)
             
-            # 验证阶段
+            # Validation phase
             valid_loss = self.validate_epoch(epoch)
             
-            # 保存最佳模型
+            # Log epoch-level metrics to wandb
+            wandb.log({
+                "epoch": epoch + 1,
+                "train_loss": train_loss,
+                "valid_loss": valid_loss,
+                "lr": self.optim_schedule.get_last_lr()[0]
+            })
+            
+            # Save the best model
             if valid_loss < self.best_loss:
                 self.best_loss = valid_loss
                 torch.save(self.model.state_dict(), self.model_save_path)
                 print(f"Saved best model with validation loss: {valid_loss:.4f}")
                 
         print("Training completed!")
+        wandb.finish()  # Finish wandb run
 
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0.0
         total_batches = 0
         
-        # 创建数据加载器的迭代器
+        # Create iterators for data loaders
         mlm_iter = iter(self.mlm_train_loader)
         anp_iter = iter(self.anp_train_loader)
         
-        # 确定最大批次数
+        # Determine the maximum number of batches
         max_batches = max(len(self.mlm_train_loader), len(self.anp_train_loader))
         
         data_iter = tqdm.tqdm(
@@ -98,63 +117,60 @@ class BERT2Trainer:
         )
         
         for i in data_iter:
-            # 清零梯度
-            self.optim.zero_grad()
+
             
-            # 准备MLM任务批次
+            # Prepare MLM task batch
             try:
                 mlm_batch = next(mlm_iter)
             except StopIteration:
                 mlm_iter = iter(self.mlm_train_loader)
                 mlm_batch = next(mlm_iter)
                 
-            # 准备ANP任务批次
+            # Prepare ANP task batch
             try:
                 anp_batch = next(anp_iter)
             except StopIteration:
                 anp_iter = iter(self.anp_train_loader)
                 anp_batch = next(anp_iter)
             
-            # 计算MLM任务损失并进行反向传播
+            # Compute MLM task loss and backpropagate
             mlm_task_dict = self.prepare_task_dict(mlm_batch)
             mlm_loss, _ = self.model(mlm_task_dict)
             
-            # 使用混合精度进行反向传播
-            if self.use_amp:
-                self.scaler.scale(mlm_loss).backward()
-            else:
-                mlm_loss.backward()
-            
-            # 计算ANP任务损失并进行反向传播
+            # Compute ANP task loss and backpropagate
             anp_task_dict = self.prepare_task_dict(anp_batch)
             anp_loss, _ = self.model(anp_task_dict)
             
-            # 使用混合精度进行反向传播
+            total_batch_loss = mlm_loss + anp_loss  # Combine losses FIRST
+            # Zero gradients
+            self.optim.zero_grad()
+            # Use mixed precision for backpropagation
             if self.use_amp:
-                self.scaler.scale(anp_loss).backward()
-            else:
-                anp_loss.backward()
-            
-            # 总损失
-            total_batch_loss = mlm_loss.item() + anp_loss.item()
-            
-            # 更新参数（立即更新）
-            if self.use_amp:
+                self.scaler.scale(total_batch_loss).backward()  # Single backward pass
                 self.scaler.step(self.optim)
                 self.scaler.update()
             else:
+                total_batch_loss.backward()  # Single backward
                 self.optim.step()
             
-            # 更新学习率
+            # Update learning rate
             self.optim_schedule.step()
             
-            # 记录损失
-            total_loss += total_batch_loss
+            # Record loss
+            total_loss += total_batch_loss.item()
             total_batches += 1
             
-            # 更新进度条
+            # Update progress bar
             avg_loss = total_loss / total_batches
-            data_iter.set_postfix(loss=total_batch_loss, avg_loss=avg_loss)
+            data_iter.set_postfix(loss=total_batch_loss.item(), avg_loss=avg_loss)
+            
+            # Log batch-level metrics to wandb
+            if i % self.log_freq == 0:
+                wandb.log({
+                    "batch": epoch * max_batches + i,
+                    "batch_train_loss": total_batch_loss.item(),
+                    "batch_avg_train_loss": avg_loss
+                })
         
         avg_epoch_loss = total_loss / total_batches
         print(f"Epoch {epoch+1} Train loss: {avg_epoch_loss:.4f}")
@@ -165,7 +181,7 @@ class BERT2Trainer:
         total_loss = 0.0
         total_batches = 0
         
-        # 验证MLM任务
+        # Validate MLM task
         with torch.no_grad():
             for mlm_batch in tqdm.tqdm(
                 self.mlm_valid_loader,
@@ -180,7 +196,7 @@ class BERT2Trainer:
                 total_loss += mlm_loss.item()
                 total_batches += 1
         
-        # 验证ANP任务
+        # Validate ANP task
         with torch.no_grad():
             for anp_batch in tqdm.tqdm(
                 self.anp_valid_loader,
@@ -227,10 +243,13 @@ class dummy_context:
         pass
 
 if __name__ == "__main__":
+    # Add wandb parameters before parsing arguments
     parser = argparse.ArgumentParser(description="Command line parameters")
     parser.add_argument("--device", default="cuda", dest="device")
     parser.add_argument("--epochs", type=int, default=20, dest="epochs")
     parser.add_argument("--batch_size", type=int, default=10, dest="batch_size")
+    parser.add_argument("--wandb_project", default="bert2-training", help="Weights & Biases project name")
+    parser.add_argument("--wandb_run", default="experiment-1", help="Weights & Biases run name")
     args = parser.parse_args()
     seq_len = 128
     data_dir = "."
@@ -312,4 +331,6 @@ if __name__ == "__main__":
         model_save_path=os.path.join(data_dir, "outputs", f"best-model.pth"),
         device=args.device,
     )
+    if args.wandb_run:
+        wandb.run.name = args.wandb_run
     trainer.train()
