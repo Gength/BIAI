@@ -72,6 +72,14 @@ class BERT2Trainer:
         })
         wandb.watch(self.model)  # Monitor model parameters
 
+        if os.path.exists(os.path.join(".", "outputs", "epoch")):
+            file_list = os.listdir(os.path.join(".", "outputs", "epoch"))
+            for file_name in file_list:
+                if os.path.isfile(os.path.join(".", "outputs", "epoch", file_name)):
+                    os.remove(os.path.join(".", "outputs", "epoch", file_name))  # Clear previous epoch files
+        else:
+            os.makedirs(os.path.join(".", "outputs", "epoch"), exist_ok=True)  # Ensure output directory exists
+
     def train(self):
         for epoch in range(self.num_epochs):
             # Training phase
@@ -85,9 +93,8 @@ class BERT2Trainer:
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
                 "valid_loss": valid_loss,
-                "lr": self.optim_schedule.get_last_lr()[0]
             })
-            
+            torch.save(self.model.state_dict(), os.path.join(".", "outputs", "epoch", f"model-epoch-{epoch+1}.pth"))  # Save model after each epoch
             # Save the best model
             if valid_loss < self.best_loss:
                 self.best_loss = valid_loss
@@ -153,9 +160,6 @@ class BERT2Trainer:
                 total_batch_loss.backward()  # Single backward
                 self.optim.step()
             
-            # Update learning rate
-            self.optim_schedule.step()
-            
             # Record loss
             total_loss += total_batch_loss.item()
             total_batches += 1
@@ -163,14 +167,18 @@ class BERT2Trainer:
             # Update progress bar
             avg_loss = total_loss / total_batches
             data_iter.set_postfix(loss=total_batch_loss.item(), avg_loss=avg_loss)
-            
+
             # Log batch-level metrics to wandb
             if i % self.log_freq == 0:
                 wandb.log({
                     "batch": epoch * max_batches + i,
                     "batch_train_loss": total_batch_loss.item(),
-                    "batch_avg_train_loss": avg_loss
+                    "batch_avg_train_loss": avg_loss,
+                    "lr": self.optim_schedule.get_last_lr()[0]
                 })
+            
+            # Update learning rate
+            self.optim_schedule.step()
         
         avg_epoch_loss = total_loss / total_batches
         print(f"Epoch {epoch+1} Train loss: {avg_epoch_loss:.4f}")

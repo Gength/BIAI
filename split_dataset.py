@@ -75,6 +75,8 @@ def split_functions():
 
     for a_func, a_group in grouped.items():
         # Generate positive pairs: all pairs within the group
+        positive_pairs_count = 0
+        negative_pairs_count = 0
         for a, b in combinations(a_group, 2):
             pairs.append({
                 "anchor_function_file": a["file_name"],
@@ -89,13 +91,15 @@ def split_functions():
                 "target_opt": b["opt"],
                 "label": 1  # Positive pair
             })
-        # Generate negative pairs: pick one from this group, one for each other group
-        for b_func, b_group in grouped.items():
-            if a_func == b_func:
-                continue
+            positive_pairs_count += 1
+        # Generate negative pairs: randomly pick one from this group, one from each other group
+        b_funcs = [k for k in grouped.keys() if k != a_func]
+        random.shuffle(b_funcs)  # Shuffle to ensure randomness
+        while negative_pairs_count < positive_pairs_count and len(b_funcs) > 0:
             a_idx = random.randint(0, len(a_group) - 1)
             a = a_group[a_idx]
-            # Randomly sample one function from the other group
+            b_func = b_funcs.pop()
+            b_group = grouped[b_func]
             b_idx = random.randint(0, len(b_group) - 1)
             b = b_group[b_idx]
             pairs.append({
@@ -111,6 +115,7 @@ def split_functions():
                 "target_opt": b["opt"],
                 "label": 0  # Negative pair
             })
+            negative_pairs_count += 1
 
     # Step 7: save CSV
     pd.DataFrame(pairs).to_csv(os.path.join(OUTPUT_DIR, "function_pool.csv"), index=False)
