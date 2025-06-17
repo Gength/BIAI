@@ -211,6 +211,7 @@ def validate(model, dataloader, criterion):
     return total_loss / len(dataloader), accuracy
 
 if __name__ == "__main__":
+    os.makedirs(os.path.join(".", "outputs", "epoch"), exist_ok=True)
     # Initialize wandb
     wandb.init(
         project="bert2-training",  # Project name
@@ -280,34 +281,6 @@ if __name__ == "__main__":
     for epoch in range(config.epochs):
         print(f"\nEpoch {epoch+1}/{config.epochs}")
         
-        # # Training phase with mixed precision
-        # total_loss = 0
-        # model.train()
-        # progress = tqdm(train_loader, desc=f"Epoch {epoch+1}")
-        
-        # for batch_idx, (a_ids, a_adj, t_ids, t_adj, labels) in enumerate(progress):
-        #     a_ids, a_adj = a_ids.to(config.device), a_adj.to(config.device)
-        #     t_ids, t_adj = t_ids.to(config.device), t_adj.to(config.device)
-        #     labels = labels.to(config.device)
-            
-        #     outputs = model(a_ids, a_adj, t_ids, t_adj)
-        #     loss = criterion(outputs, labels)
-        #     optimizer.zero_grad()
-
-            
-        #     # Scaled backpropagation
-        #     scaler.scale(loss).backward()
-        #     scaler.step(optimizer)
-        #     scaler.update()
-            
-        #     # Log current batch loss
-        #     current_loss = loss.item()
-        #     wandb.log({"batch_loss": current_loss})
-            
-        #     total_loss += current_loss
-        #     avg_batch_loss = total_loss / (batch_idx + 1)
-        #     progress.set_postfix(loss=current_loss, avg_loss=avg_batch_loss)
-        
         # Compute average epoch loss
         train_loss = train(model, train_loader, optimizer, criterion, scaler)
         print(f"Train Loss: {train_loss:.4f}")
@@ -337,6 +310,8 @@ if __name__ == "__main__":
             print(f"Saved new best model with accuracy {val_acc:.4f}")
             # Optionally: save best model to wandb
             wandb.save(config.save_path)
+        save_path = os.path.join(".", "outputs", "epoch", f"epoch-{epoch}-semantic_model.pth")
+        torch.save(model.state_dict(), save_path)
         
         # Save model with lowest validation loss
         if val_loss < best_val_loss:
