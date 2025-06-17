@@ -204,6 +204,14 @@ class SiameseNetwork(nn.Module):
         )
 
     def forward(self, a_ids, a_adj, t_ids, t_adj):
+        """
+        a_ids: Input IDs for anchor nodes [batch_size, num_nodes, seq_len]
+        a_adj: Adjacency matrix for anchor nodes [batch_size, num_nodes, num_nodes]
+        t_ids: Input IDs for target nodes [batch_size, num_nodes, seq_len]
+        t_adj: Adjacency matrix for target nodes [batch_size, num_nodes, num_nodes]
+        Output:
+            Similarity score [batch_size]
+        """
         # Get graph embeddings
         a_embed = self.semantic_model(a_ids, a_adj)
         t_embed = self.semantic_model(t_ids, t_adj)

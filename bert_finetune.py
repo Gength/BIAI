@@ -14,6 +14,7 @@ from utils.utility import tokenize_and_pad
 import wandb
 from models.model import SemanticAwareModel, SiameseNetwork
 from models.tokenizer import AsmTokenizer
+from models.dataset import FunctionPairDataset
 
 # Configuration parameters
 class Config:
@@ -28,84 +29,6 @@ class Config:
     save_path = os.path.join(".", "outputs", "semantic_model.pth")  # Model save path
 
 config = Config()
-
-# Custom dataset class
-class FunctionPairDataset(Dataset):
-    def __init__(self, csv_path, jsonl_path, mapping_path, tokenizer:AsmTokenizer):
-        self.df = pd.read_csv(csv_path)
-        self.dataset = load_dataset(
-            "json", 
-            data_files=jsonl_path,
-            split="train",
-            cache_dir= os.path.join(".", "outputs", "cache"),
-            keep_in_memory=False
-        )
-        with open(mapping_path, "rb") as f:
-            self.mapping = pickle.load(f)
-        self.tokenizer = tokenizer
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        a_key = (row["anchor_function_name"], row["anchor_compiler"], 
-                str(row["anchor_version"]), row["anchor_opt"], row["anchor_function_file"])
-        t_key = (row["target_function_name"], row["target_compiler"], 
-                str(row["target_version"]), row["target_opt"], row["target_function_file"])
-        
-        a_idx = self.mapping[a_key]
-        t_idx = self.mapping[t_key]
-        
-        a_data = self.dataset[a_idx]
-        t_data = self.dataset[t_idx]
-        
-        # Process the first function
-        a_input_ids, a_adj = self.process_function(a_data)
-        # Process the second function
-        t_input_ids, t_adj = self.process_function(t_data)
-        
-        label = torch.tensor(row["label"], dtype=torch.float32)
-        return a_input_ids, a_adj, t_input_ids, t_adj, label
-
-    def process_function(self, func_data):
-        # 1. Process instruction blocks
-        instr_blocks = func_data["instruction_blocks"]
-        processed_blocks = []
-        for block in instr_blocks:
-            # Tokenize and pad each block
-            processed_block = tokenize_and_pad(
-                text=block, 
-                tokenizer=self.tokenizer, 
-                seq_len=config.seq_len  # Reserve space for <CLS> and <SEP>
-            )
-            processed_blocks.append(torch.tensor(processed_block))
-        if len(processed_blocks) >= config.max_blocks:
-            processed_blocks = processed_blocks[:config.max_blocks]
-        else:
-            # Pad with <PAD> tokens if fewer than max_blocks
-            # ensure the number of blocks is equal to max_blocks
-            for _ in range(config.max_blocks - len(processed_blocks)):
-                processed_blocks.append(torch.tensor([self.tokenizer.pad_token_id] * config.seq_len))
-        input_ids = torch.stack(processed_blocks, dim=0)
-        
-        # 2. Process adjacency matrix
-        adj_data = func_data["adjacency_matrix"]
-        adj = coo_matrix(
-            (adj_data["data"], (adj_data["row"], adj_data["col"])),
-            shape=(adj_data["shape"])
-        ).toarray()
-
-        
-        # Adjust adjacency matrix size
-        if adj.shape[0] > config.max_blocks:
-            adj = adj[:config.max_blocks, :config.max_blocks]
-        elif adj.shape[0] < config.max_blocks:
-            padded_adj = np.zeros((config.max_blocks, config.max_blocks))
-            padded_adj[:adj.shape[0], :adj.shape[1]] = adj
-            adj = padded_adj
-        
-        return input_ids, torch.tensor(adj, dtype=torch.float32)
 
 # Initialize model
 def init_model(vocab_size):
@@ -181,7 +104,7 @@ def validate(model, dataloader, criterion):
             
             # Calculate accuracy
             predictions = (outputs > 0.5).float()
-            correct += (predictions == labels).sum().item()
+            correct += (predictions.to(torch.int32) == labels.to(torch.int32)).sum().item()
             total += labels.size(0)
     
     accuracy = correct / total
@@ -211,14 +134,18 @@ if __name__ == "__main__":
         csv_path="outputs/train-function_pool.csv",
         jsonl_path="outputs/baseline-train.jsonl",
         mapping_path="outputs/train-function-idx-mapping.pkl",
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
+        seq_len=config.seq_len,
+        max_blocks=config.max_blocks
     )
     
     val_dataset = FunctionPairDataset(
         csv_path="outputs/val-function_pool.csv",
         jsonl_path="outputs/baseline-val.jsonl",
         mapping_path="outputs/val-function-idx-mapping.pkl",
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
+        seq_len=config.seq_len,
+        max_blocks=config.max_blocks
     )
     
     # Create data loaders
