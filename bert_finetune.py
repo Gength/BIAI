@@ -6,28 +6,28 @@ import os
 import pandas as pd
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
 from datasets import load_dataset
 from scipy.sparse import coo_matrix
 from models.bert import SemanticAwareModel, BERT2
 from tqdm import tqdm
 from models.tokenizer import AsmTokenizer
-from models.dataset import BERTMLMDataset
-# 配置参数
+import wandb
+
+# Configuration parameters
 class Config:
     batch_size = 5
-    max_blocks = 50  # 最大基本块数
-    seq_len = 128    # 序列最大长度
-    hidden_dim = 64  # 图嵌入维度
+    max_blocks = 50  # Maximum number of basic blocks
+    seq_len = 128    # Maximum sequence length
+    hidden_dim = 64  # Graph embedding dimension
     lr = 1e-4
     epochs = 10
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    bert_checkpoint = vocab_file=os.path.join(".", "outputs", "epoch", "best-model.pth")  # 预训练BERT路径
-    save_path = os.path.join(".", "outputs", "semantic_model.pth")  # 模型保存路径
+    bert_checkpoint = vocab_file=os.path.join(".", "outputs", "epoch", "best-model.pth")  # Pretrained BERT path
+    save_path = os.path.join(".", "outputs", "semantic_model.pth")  # Model save path
 
 config = Config()
 
-# 自定义数据集类
+# Custom dataset class
 class FunctionPairDataset(Dataset):
     def __init__(self, csv_path, jsonl_path, mapping_path):
         self.df = load_dataset(
@@ -64,24 +64,24 @@ class FunctionPairDataset(Dataset):
         a_data = self.dataset[a_idx]
         t_data = self.dataset[t_idx]
         
-        # 处理第一个函数
+        # Process the first function
         a_input_ids, a_adj = self.process_function(a_data)
-        # 处理第二个函数
+        # Process the second function
         t_input_ids, t_adj = self.process_function(t_data)
         
         label = torch.tensor(row["label"], dtype=torch.float32)
         return a_input_ids, a_adj, t_input_ids, t_adj, label
 
     def process_function(self, func_data):
-        # 1. 处理指令块
+        # 1. Process instruction blocks
         blocks = func_data["instruction_blocks"]
         tokenized_blocks = []
         for block in blocks:
             tokens = self.tokenizer.encode(block)
-            tokens = tokens[:config.seq_len - 2]  # 截断到最大长度
-            pad_len = config.seq_len - len(tokens) - 2  # 减去<CLS>和<SEP>
+            tokens = tokens[:config.seq_len - 2]  # Truncate to max length
+            pad_len = config.seq_len - len(tokens) - 2  # Subtract <CLS> and <SEP>
             tokens = [self.tokenizer.vocab['<CLS>']] + tokens + [self.tokenizer.vocab['<SEP>']]
-            tokens += [self.tokenizer.vocab['<PAD>']] * pad_len  # 填充到最大长度
+            tokens += [self.tokenizer.vocab['<PAD>']] * pad_len  # Pad to max length
             tokenized_blocks.append(torch.tensor(tokens))
         if len(tokenized_blocks) >= config.max_blocks:
             tokenized_blocks = tokenized_blocks[:config.max_blocks]
@@ -90,7 +90,7 @@ class FunctionPairDataset(Dataset):
                 tokenized_blocks.append(torch.tensor([self.tokenizer.vocab['<PAD>']] * config.seq_len))
         input_ids = torch.stack(tokenized_blocks, dim=0)
         
-        # 2. 处理邻接矩阵
+        # 2. Process adjacency matrix
         adj_data = func_data["adjacency_matrix"]
         adj = coo_matrix(
             (adj_data["data"], (adj_data["row"], adj_data["col"])),
@@ -98,7 +98,7 @@ class FunctionPairDataset(Dataset):
         ).toarray()
 
         
-        # 调整邻接矩阵大小
+        # Adjust adjacency matrix size
         if adj.shape[0] > config.max_blocks:
             adj = adj[:config.max_blocks, :config.max_blocks]
         elif adj.shape[0] < config.max_blocks:
@@ -108,7 +108,7 @@ class FunctionPairDataset(Dataset):
         
         return input_ids, torch.tensor(adj, dtype=torch.float32)
 
-# 孪生网络模型
+# Siamese network model
 class SiameseNetwork(nn.Module):
     def __init__(self, semantic_model):
         super().__init__()
@@ -122,17 +122,17 @@ class SiameseNetwork(nn.Module):
         )
 
     def forward(self, a_ids, a_adj, t_ids, t_adj):
-        # 获取图嵌入
+        # Get graph embeddings
         a_embed = self.semantic_model(a_ids, a_adj)
         t_embed = self.semantic_model(t_ids, t_adj)
         
-        # 合并嵌入并分类
+        # Concatenate embeddings and classify
         combined = torch.cat([a_embed, t_embed], dim=1)
         return self.classifier(combined).squeeze()
 
-# 初始化模型
+# Initialize model
 def init_model(vocab_size):
-    # 加载预训练BERT
+    # Load pretrained BERT
     bert_model = BERT2(
         vocab_size=vocab_size,
         d_model=128,
@@ -143,7 +143,7 @@ def init_model(vocab_size):
     )
     bert_model.load_state_dict(torch.load(config.bert_checkpoint))
     
-    # 创建语义感知模型
+    # Create semantic-aware model
     semantic_model = SemanticAwareModel(
         bert_model=bert_model,
         d_model=128,
@@ -153,29 +153,39 @@ def init_model(vocab_size):
     
     return SiameseNetwork(semantic_model).to(config.device)
 
-# 训练函数
-def train(model, dataloader, optimizer, criterion):
+# Update training function to use AMP
+def train(model, dataloader, optimizer, criterion, scaler=None, log_freq = 10):  # Add scaler argument
     model.train()
     total_loss = 0
     progress = tqdm(dataloader, desc="Training")
-    
-    for a_ids, a_adj, t_ids, t_adj, labels in progress:
+    for i, (a_ids, a_adj, t_ids, t_adj, labels) in enumerate(progress):
         a_ids, a_adj = a_ids.to(config.device), a_adj.to(config.device)
         t_ids, t_adj = t_ids.to(config.device), t_adj.to(config.device)
         labels = labels.to(config.device)
         
-        optimizer.zero_grad()
+        # Enable autocast for forward pass
+
         outputs = model(a_ids, a_adj, t_ids, t_adj)
         loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        
+        optimizer.zero_grad()
+        if scaler is not None:
+            # Scale loss and backpropagate
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # Regular backpropagation
+            loss.backward()
+            optimizer.step()
+        if i % log_freq == 0:
+            # Log current batch loss
+            wandb.log({"batch_loss": loss.item()})
         total_loss += loss.item()
         progress.set_postfix(loss=loss.item())
     
     return total_loss / len(dataloader)
 
-# 验证函数
+# Validation function
 def validate(model, dataloader, criterion):
     model.eval()
     total_loss = 0
@@ -192,7 +202,7 @@ def validate(model, dataloader, criterion):
             loss = criterion(outputs, labels)
             total_loss += loss.item()
             
-            # 计算准确率
+            # Calculate accuracy
             predictions = (outputs > 0.5).float()
             correct += (predictions == labels).sum().item()
             total += labels.size(0)
@@ -201,11 +211,24 @@ def validate(model, dataloader, criterion):
     return total_loss / len(dataloader), accuracy
 
 if __name__ == "__main__":
-    # 初始化tokenizer获取词汇表大小
+    # Initialize wandb
+    wandb.init(
+        project="bert2-training",  # Project name
+        config={
+            "batch_size": config.batch_size,
+            "learning_rate": config.lr,
+            "epochs": config.epochs,
+            "max_blocks": config.max_blocks,
+            "seq_len": config.seq_len,
+            "hidden_dim": config.hidden_dim
+        }
+    )
+    wandb.run.name = "bert2-finetuning"  # Set run name
+    # Initialize tokenizer to get vocab size
     tokenizer = AsmTokenizer(vocab_file="outputs/baseline-vocab.txt")
     vocab_size = len(tokenizer.vocab)
     
-    # 创建数据集
+    # Create datasets
     train_dataset = FunctionPairDataset(
         csv_path="outputs/train-function_pool.csv",
         jsonl_path="outputs/baseline-train.jsonl",
@@ -218,7 +241,7 @@ if __name__ == "__main__":
         mapping_path="outputs/val-function-idx-mapping.pkl"
     )
     
-    # 创建数据加载器
+    # Create data loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -235,29 +258,91 @@ if __name__ == "__main__":
         pin_memory=True
     )
     
-    # 初始化模型
+    # Initialize model
     model = init_model(vocab_size)
+    wandb.watch(model, log=None)  # Monitor model parameters
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
-    criterion = nn.BCELoss()  # 二分类交叉熵
+    criterion = nn.BCELoss()  # Binary cross-entropy
+    scaler = torch.amp.GradScaler('cuda')
+    # Add learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min',          # Monitor validation loss minimization
+        factor=0.5,          # Learning rate decay factor
+        patience=3,          # Reduce learning rate after 3 epochs without improvement
+        min_lr=1e-6          # Minimum learning rate
+    )
     
     best_accuracy = 0
+    best_val_loss = float('inf')
     print(f"Starting training on {config.device}...")
     
     for epoch in range(config.epochs):
         print(f"\nEpoch {epoch+1}/{config.epochs}")
         
-        # 训练
-        train_loss = train(model, train_loader, optimizer, criterion)
+        # # Training phase with mixed precision
+        # total_loss = 0
+        # model.train()
+        # progress = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        
+        # for batch_idx, (a_ids, a_adj, t_ids, t_adj, labels) in enumerate(progress):
+        #     a_ids, a_adj = a_ids.to(config.device), a_adj.to(config.device)
+        #     t_ids, t_adj = t_ids.to(config.device), t_adj.to(config.device)
+        #     labels = labels.to(config.device)
+            
+        #     outputs = model(a_ids, a_adj, t_ids, t_adj)
+        #     loss = criterion(outputs, labels)
+        #     optimizer.zero_grad()
+
+            
+        #     # Scaled backpropagation
+        #     scaler.scale(loss).backward()
+        #     scaler.step(optimizer)
+        #     scaler.update()
+            
+        #     # Log current batch loss
+        #     current_loss = loss.item()
+        #     wandb.log({"batch_loss": current_loss})
+            
+        #     total_loss += current_loss
+        #     avg_batch_loss = total_loss / (batch_idx + 1)
+        #     progress.set_postfix(loss=current_loss, avg_loss=avg_batch_loss)
+        
+        # Compute average epoch loss
+        train_loss = train(model, train_loader, optimizer, criterion, scaler)
         print(f"Train Loss: {train_loss:.4f}")
         
-        # 验证
+        # Validation phase
         val_loss, val_acc = validate(model, val_loader, criterion)
         print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
         
-        # 保存最佳模型
+        # Update learning rate
+        scheduler.step(val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Current learning rate: {current_lr:.8f}")
+        
+        # Log epoch metrics to wandb
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "val_accuracy": val_acc,
+            "learning_rate": current_lr
+        })
+        
+        # Save best model
         if val_acc > best_accuracy:
             best_accuracy = val_acc
             torch.save(model.state_dict(), config.save_path)
             print(f"Saved new best model with accuracy {val_acc:.4f}")
+            # Optionally: save best model to wandb
+            wandb.save(config.save_path)
+        
+        # Save model with lowest validation loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            # Optionally save a separate checkpoint, here using the same file
+            # Or use torch.save(model.state_dict(), "best_val_loss_model.pth")
     
     print("Training completed!")
+    wandb.finish()  # End wandb run

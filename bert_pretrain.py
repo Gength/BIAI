@@ -262,7 +262,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cuda", dest="device")
     parser.add_argument("--epochs", type=int, default=20, dest="epochs")
     parser.add_argument("--batch_size", type=int, default=10, dest="batch_size")
-    parser.add_argument("--wandb_project", default="bert2-training", help="Weights & Biases project name")
+    parser.add_argument("--wandb_project", default="bert2-pretraining", help="Weights & Biases project name")
     parser.add_argument("--wandb_run", default="experiment-1", help="Weights & Biases run name")
     args = parser.parse_args()
     seq_len = 128
