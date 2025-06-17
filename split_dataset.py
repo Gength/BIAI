@@ -194,14 +194,14 @@ if __name__ == '__main__':
         p.join()
     
     # build vocab
-    # vocab = {"<PAD>": 0, "<CLS>": 1, "<SEP>": 2, "<MASK>": 3, "<UNK>": 4, "<const>": 5}
-    # from datasets import load_dataset
-    # tokenizer = AsmTokenizer(vocab_file=os.path.join(OUTPUT_DIR, "baseline-vocab.txt"))
-    # tokenizer.vocab = vocab  # Use the predefined vocab
-    # for dataset_name in ["baseline-train", "baseline-val", "baseline-test"]:
-    #     dataset_path = os.path.join(".", "outputs", f"{dataset_name}.jsonl")
-    #     dataset = load_dataset('json', data_files=dataset_path, split="train", streaming=True)
-    #     for data in dataset:
-    #             tokenizer.build_vocab(data['instruction_blocks'])
-    # # Save vocab to file
-    # tokenizer.save_vocab(os.path.join(OUTPUT_DIR, "baseline-vocab.txt"))
+    vocab = {"<PAD>": 0, "<CLS>": 1, "<SEP>": 2, "<MASK>": 3, "<UNK>": 4, "<const>": 5}
+    from datasets import load_dataset
+    tokenizer = AsmTokenizer(vocab_file=os.path.join(OUTPUT_DIR, "baseline-vocab.txt"))
+    tokenizer.vocab = vocab  # Use the predefined vocab
+    for dataset_name in ["baseline-train", "baseline-val", "baseline-test"]:
+        dataset_path = os.path.join(".", "outputs", f"{dataset_name}.jsonl")
+        dataset = load_dataset('json', data_files=dataset_path, split="train", streaming=True)
+        for data in dataset:
+                tokenizer.build_vocab(data['instruction_blocks'])
+    # Save vocab to file
+    tokenizer.save_vocab(os.path.join(OUTPUT_DIR, "baseline-vocab.txt"))

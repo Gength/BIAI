@@ -8,10 +8,12 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 from scipy.sparse import coo_matrix
-from models.bert import SemanticAwareModel, BERT2
+from models.bert import BERT2
 from tqdm import tqdm
-from models.tokenizer import AsmTokenizer
+from utils.utility import tokenize_and_pad
 import wandb
+from models.model import SemanticAwareModel, SiameseNetwork
+from models.tokenizer import AsmTokenizer
 
 # Configuration parameters
 class Config:
@@ -29,14 +31,8 @@ config = Config()
 
 # Custom dataset class
 class FunctionPairDataset(Dataset):
-    def __init__(self, csv_path, jsonl_path, mapping_path):
-        self.df = load_dataset(
-            "csv",
-            data_files=csv_path,
-            split="train",
-            cache_dir=os.path.join(".", "outputs", "cache"),
-            keep_in_memory=False
-        ).to_pandas(batch_size=config.batch_size)
+    def __init__(self, csv_path, jsonl_path, mapping_path, tokenizer:AsmTokenizer):
+        self.df = pd.read_csv(csv_path)
         self.dataset = load_dataset(
             "json", 
             data_files=jsonl_path,
@@ -46,7 +42,7 @@ class FunctionPairDataset(Dataset):
         )
         with open(mapping_path, "rb") as f:
             self.mapping = pickle.load(f)
-        self.tokenizer = AsmTokenizer(vocab_file=os.path.join(".", "outputs", f"baseline-vocab.txt"))
+        self.tokenizer = tokenizer
 
     def __len__(self):
         return len(self.df)
@@ -74,21 +70,24 @@ class FunctionPairDataset(Dataset):
 
     def process_function(self, func_data):
         # 1. Process instruction blocks
-        blocks = func_data["instruction_blocks"]
-        tokenized_blocks = []
-        for block in blocks:
-            tokens = self.tokenizer.encode(block)
-            tokens = tokens[:config.seq_len - 2]  # Truncate to max length
-            pad_len = config.seq_len - len(tokens) - 2  # Subtract <CLS> and <SEP>
-            tokens = [self.tokenizer.vocab['<CLS>']] + tokens + [self.tokenizer.vocab['<SEP>']]
-            tokens += [self.tokenizer.vocab['<PAD>']] * pad_len  # Pad to max length
-            tokenized_blocks.append(torch.tensor(tokens))
-        if len(tokenized_blocks) >= config.max_blocks:
-            tokenized_blocks = tokenized_blocks[:config.max_blocks]
+        instr_blocks = func_data["instruction_blocks"]
+        processed_blocks = []
+        for block in instr_blocks:
+            # Tokenize and pad each block
+            processed_block = tokenize_and_pad(
+                text=block, 
+                tokenizer=self.tokenizer, 
+                seq_len=config.seq_len  # Reserve space for <CLS> and <SEP>
+            )
+            processed_blocks.append(torch.tensor(processed_block))
+        if len(processed_blocks) >= config.max_blocks:
+            processed_blocks = processed_blocks[:config.max_blocks]
         else:
-            for _ in range(config.max_blocks - len(tokenized_blocks)):
-                tokenized_blocks.append(torch.tensor([self.tokenizer.vocab['<PAD>']] * config.seq_len))
-        input_ids = torch.stack(tokenized_blocks, dim=0)
+            # Pad with <PAD> tokens if fewer than max_blocks
+            # ensure the number of blocks is equal to max_blocks
+            for _ in range(config.max_blocks - len(processed_blocks)):
+                processed_blocks.append(torch.tensor([self.tokenizer.pad_token_id] * config.seq_len))
+        input_ids = torch.stack(processed_blocks, dim=0)
         
         # 2. Process adjacency matrix
         adj_data = func_data["adjacency_matrix"]
@@ -107,28 +106,6 @@ class FunctionPairDataset(Dataset):
             adj = padded_adj
         
         return input_ids, torch.tensor(adj, dtype=torch.float32)
-
-# Siamese network model
-class SiameseNetwork(nn.Module):
-    def __init__(self, semantic_model):
-        super().__init__()
-        self.semantic_model = semantic_model
-        self.classifier = nn.Sequential(
-            nn.Linear(2 * config.hidden_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, a_ids, a_adj, t_ids, t_adj):
-        # Get graph embeddings
-        a_embed = self.semantic_model(a_ids, a_adj)
-        t_embed = self.semantic_model(t_ids, t_adj)
-        
-        # Concatenate embeddings and classify
-        combined = torch.cat([a_embed, t_embed], dim=1)
-        return self.classifier(combined).squeeze()
 
 # Initialize model
 def init_model(vocab_size):
@@ -151,7 +128,7 @@ def init_model(vocab_size):
         device=config.device
     ).to(config.device)
     
-    return SiameseNetwork(semantic_model).to(config.device)
+    return SiameseNetwork(semantic_model, config.hidden_dim).to(config.device)
 
 # Update training function to use AMP
 def train(model, dataloader, optimizer, criterion, scaler=None, log_freq = 10):  # Add scaler argument
@@ -233,13 +210,15 @@ if __name__ == "__main__":
     train_dataset = FunctionPairDataset(
         csv_path="outputs/train-function_pool.csv",
         jsonl_path="outputs/baseline-train.jsonl",
-        mapping_path="outputs/train-function-idx-mapping.pkl"
+        mapping_path="outputs/train-function-idx-mapping.pkl",
+        tokenizer=tokenizer
     )
     
     val_dataset = FunctionPairDataset(
         csv_path="outputs/val-function_pool.csv",
         jsonl_path="outputs/baseline-val.jsonl",
-        mapping_path="outputs/val-function-idx-mapping.pkl"
+        mapping_path="outputs/val-function-idx-mapping.pkl",
+        tokenizer=tokenizer
     )
     
     # Create data loaders

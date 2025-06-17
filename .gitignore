@@ -9,3 +9,4 @@ duplicated.py
 *.ipynb
 wandb/
 slurm/
+*sh.o*

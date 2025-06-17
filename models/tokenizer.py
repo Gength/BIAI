@@ -6,6 +6,12 @@ class AsmTokenizer:
 	def __init__(self, corpus=None, vocab_file=None, max_vocab_size=5000):
 		self.max_vocab_size = max_vocab_size
 		self.vocab = {"<PAD>": 0, "<CLS>": 1, "<SEP>": 2, "<MASK>": 3, "<UNK>": 4, "<const>": 5}
+		self.cls_token_id = self.vocab["<CLS>"]
+		self.sep_token_id = self.vocab["<SEP>"]
+		self.pad_token_id = self.vocab["<PAD>"]
+		self.mask_token_id = self.vocab["<MASK>"]
+		self.unk_token_id = self.vocab["<UNK>"]
+		self.const_token_id = self.vocab["<const>"]
 		self.rev_vocab = {v: k for k, v in self.vocab.items()}
 		if vocab_file and os.path.exists(vocab_file):
 			self.load_vocab(vocab_file)
