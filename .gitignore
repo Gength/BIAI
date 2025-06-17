@@ -8,3 +8,4 @@ baseline/
 duplicated.py
 *.ipynb
 wandb/
+slurm/
