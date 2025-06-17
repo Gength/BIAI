@@ -97,7 +97,7 @@ class BERT2Trainer:
                 "train_loss": train_loss,
                 "valid_loss": valid_loss,
             })
-            torch.save(self.model.state_dict(), os.path.join(".", "outputs", "epoch", f"model-epoch-{epoch+1}.pth"))  # Save model after each epoch
+            torch.save(self.model.state_dict(), os.path.join(".", "outputs", "epoch", f"bert2-epoch-{epoch+1}.pth"))  # Save model after each epoch
             # Save the best model
             if valid_loss < self.best_loss:
                 self.best_loss = valid_loss
@@ -342,7 +342,7 @@ if __name__ == "__main__":
         mlm_valid_loader=mlm_valid_loader,
         anp_valid_loader=anp_valid_loader,
         num_epochs=args.epochs,
-        model_save_path=os.path.join(data_dir, "outputs", "epoch", f"best-model.pth"),
+        model_save_path=os.path.join(data_dir, "outputs", "epoch", f"bert2-best.pth"),
         device=args.device,
     )
     if args.wandb_run:

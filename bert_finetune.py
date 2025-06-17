@@ -1,32 +1,26 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import pickle
 import os
-import pandas as pd
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from datasets import load_dataset
-from scipy.sparse import coo_matrix
+from torch.utils.data import DataLoader
 from models.bert import BERT2
 from tqdm import tqdm
-from utils.utility import tokenize_and_pad
 import wandb
-from models.model import SemanticAwareModel, SiameseNetwork
+from models.model import CFGFusionModel, SimilarityClassifier
 from models.tokenizer import AsmTokenizer
 from models.dataset import FunctionPairDataset
 
 # Configuration parameters
 class Config:
-    batch_size = 5
+    batch_size = 7
     max_blocks = 50  # Maximum number of basic blocks
     seq_len = 128    # Maximum sequence length
     hidden_dim = 64  # Graph embedding dimension
     lr = 1e-4
     epochs = 10
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    bert_checkpoint = vocab_file=os.path.join(".", "outputs", "epoch", "best-model.pth")  # Pretrained BERT path
-    save_path = os.path.join(".", "outputs", "semantic_model.pth")  # Model save path
+    bert_checkpoint = vocab_file=os.path.join(".", "outputs", "epoch", "bert2-best.pth")  # Pretrained BERT path
+    save_path = os.path.join(".", "outputs", "CFGFusion-best.pth")  # best Model save path
 
 config = Config()
 
@@ -44,14 +38,14 @@ def init_model(vocab_size):
     bert_model.load_state_dict(torch.load(config.bert_checkpoint))
     
     # Create semantic-aware model
-    semantic_model = SemanticAwareModel(
+    cfgfusion_model = CFGFusionModel(
         bert_model=bert_model,
         d_model=128,
         hidden_dim=config.hidden_dim,
         device=config.device
     ).to(config.device)
     
-    return SiameseNetwork(semantic_model, config.hidden_dim).to(config.device)
+    return SimilarityClassifier(cfgfusion_model, config.hidden_dim).to(config.device)
 
 # Update training function to use AMP
 def train(model, dataloader, optimizer, criterion, scaler=None, log_freq = 10):  # Add scaler argument
@@ -64,9 +58,9 @@ def train(model, dataloader, optimizer, criterion, scaler=None, log_freq = 10): 
         labels = labels.to(config.device)
         
         # Enable autocast for forward pass
-
-        outputs = model(a_ids, a_adj, t_ids, t_adj)
-        loss = criterion(outputs, labels)
+        with torch.autocast(device_type="cuda"):
+            outputs = model(a_ids, a_adj, t_ids, t_adj)
+            loss = criterion(outputs, labels)
         optimizer.zero_grad()
         if scaler is not None:
             # Scale loss and backpropagate
@@ -101,9 +95,10 @@ def validate(model, dataloader, criterion):
             outputs = model(a_ids, a_adj, t_ids, t_adj)
             loss = criterion(outputs, labels)
             total_loss += loss.item()
-            
+            # add sigmoid activation for binary classification
+            probs = torch.sigmoid(outputs)
             # Calculate accuracy
-            predictions = (outputs > 0.5).float()
+            predictions = (probs > 0.5).float()
             correct += (predictions.to(torch.int32) == labels.to(torch.int32)).sum().item()
             total += labels.size(0)
     
@@ -131,18 +126,18 @@ if __name__ == "__main__":
     
     # Create datasets
     train_dataset = FunctionPairDataset(
-        csv_path="outputs/train-function_pool.csv",
-        jsonl_path="outputs/baseline-train.jsonl",
-        mapping_path="outputs/train-function-idx-mapping.pkl",
+        csv_path=os.path.join(".", "outputs", "train-function_pool.csv"),
+        jsonl_path=os.path.join(".", "outputs", "baseline-train.jsonl"),
+        mapping_path=os.path.join(".", "outputs", "train-function-idx-mapping.pkl"),
         tokenizer=tokenizer,
         seq_len=config.seq_len,
         max_blocks=config.max_blocks
     )
     
     val_dataset = FunctionPairDataset(
-        csv_path="outputs/val-function_pool.csv",
-        jsonl_path="outputs/baseline-val.jsonl",
-        mapping_path="outputs/val-function-idx-mapping.pkl",
+        csv_path=os.path.join(".", "outputs", "val-function_pool.csv"),
+        jsonl_path=os.path.join(".", "outputs", "baseline-val.jsonl"),
+        mapping_path=os.path.join(".", "outputs", "val-function-idx-mapping.pkl"),
         tokenizer=tokenizer,
         seq_len=config.seq_len,
         max_blocks=config.max_blocks
@@ -154,6 +149,8 @@ if __name__ == "__main__":
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=4,
+        prefetch_factor=2,  # Prefetch data for faster loading
+        persistent_workers=True,  # Keep workers alive for faster subsequent epochs
         pin_memory=True
     )
     
@@ -162,6 +159,8 @@ if __name__ == "__main__":
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=2,
+        prefetch_factor=2,  # Prefetch data for faster loading
+        persistent_workers=True,  # Keep workers alive for faster subsequent epochs
         pin_memory=True
     )
     
@@ -169,7 +168,7 @@ if __name__ == "__main__":
     model = init_model(vocab_size)
     wandb.watch(model, log=None)  # Monitor model parameters
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
-    criterion = nn.BCELoss()  # Binary cross-entropy
+    criterion = nn.BCEWithLogitsLoss() # Binary cross-entropy
     scaler = torch.amp.GradScaler('cuda')
     # Add learning rate scheduler
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -214,9 +213,7 @@ if __name__ == "__main__":
             best_accuracy = val_acc
             torch.save(model.state_dict(), config.save_path)
             print(f"Saved new best model with accuracy {val_acc:.4f}")
-            # Optionally: save best model to wandb
-            wandb.save(config.save_path)
-        save_path = os.path.join(".", "outputs", "epoch", f"epoch-{epoch}-semantic_model.pth")
+        save_path = os.path.join(".", "outputs", "epoch", f"CFGFusion-epoch-{epoch}.pth")
         torch.save(model.state_dict(), save_path)
         
         # Save model with lowest validation loss

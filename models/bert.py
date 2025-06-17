@@ -200,7 +200,7 @@ class BERTEmbedding(torch.nn.Module):
 		x = token_embedding + position_embedding
 		return self.dropout(x)
 
-class BERT(torch.nn.Module):
+class BERT_Block(torch.nn.Module):
 	"""
 	BERT model : Bidirectional Encoder Representations from Transformers.
 	"""
@@ -269,7 +269,7 @@ class BERT(torch.nn.Module):
 		summed = torch.sum(x * attention_mask, dim=1)
 		return summed
 
-class BaseBERT(nn.Module):
+class BERT(nn.Module):
     def __init__(self, vocab_size, d_model=128, n_layers=12, 
                  heads=8, seq_len=128, dropout=0.1, device="cuda"):
         super().__init__()
@@ -277,7 +277,7 @@ class BaseBERT(nn.Module):
         self.seq_len = seq_len
         
         # Shared BERT encoder
-        self.bert = BERT(vocab_size, d_model, n_layers, heads, seq_len, dropout, device)
+        self.bert = BERT_Block(vocab_size, d_model, n_layers, heads, seq_len, dropout, device)
         
         # MLM task head
         self.mlm_head = MaskedLanguageModel(d_model, vocab_size)
@@ -338,7 +338,7 @@ class ANPHead(nn.Module):
         x = torch.cat([vec_a, vec_b], dim=1)
         return self.classifier(x)
 	
-class BERT2(BaseBERT):
+class BERT2(BERT):
     def __init__(self, vocab_size, d_model=128, n_layers=12, 
                  heads=8, seq_len=128, dropout=0.1, device="cuda"):
         super().__init__(vocab_size, d_model, n_layers, heads, seq_len, dropout, device)

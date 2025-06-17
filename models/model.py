@@ -123,7 +123,7 @@ class OrderCNN(nn.Module):
         return self.fc_out(x)
 
 
-class SemanticAwareModel(nn.Module):
+class CFGFusionModel(nn.Module):
     """
     Complete semantic-aware model integrating three components:
     1. Semantic-aware modeling (BERT)
@@ -191,7 +191,7 @@ class SemanticAwareModel(nn.Module):
         
         return graph_embedding
 
-class SiameseNetwork(nn.Module):
+class SimilarityClassifier(nn.Module):
     def __init__(self, semantic_model, graph_hidden_dim=64):
         super().__init__()
         self.semantic_model = semantic_model
@@ -200,8 +200,13 @@ class SiameseNetwork(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(128, 1),
-            nn.Sigmoid() # binary classification
+            # nn.Sigmoid()
         )
+        # RuntimeError: torch.nn.functional.binary_cross_entropy and torch.nn.BCELoss are unsafe to autocast.
+        # Many models use a sigmoid layer right before the binary cross entropy layer.
+        # In this case, combine the two layers using torch.nn.functional.binary_cross_entropy_with_logits
+        # or torch.nn.BCEWithLogitsLoss.  binary_cross_entropy_with_logits and BCEWithLogits are
+        # safe to autocast.
 
     def forward(self, a_ids, a_adj, t_ids, t_adj):
         """
