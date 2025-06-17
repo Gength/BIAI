@@ -10,6 +10,7 @@ from datasets import load_dataset
 from models.dataset import TaskDataset
 from models.collatefn import MLMCollateFn, ANPCollateFn, CombinedCollateFn
 import wandb
+import time
 
 class BERT2Trainer:
     def __init__(
@@ -70,7 +71,7 @@ class BERT2Trainer:
             "epochs": num_epochs,
             "device": device
         })
-        wandb.watch(self.model)  # Monitor model parameters
+        wandb.watch(self.model, log=None)
 
         if os.path.exists(os.path.join(".", "outputs", "epoch")):
             file_list = os.listdir(os.path.join(".", "outputs", "epoch"))
@@ -81,6 +82,8 @@ class BERT2Trainer:
             os.makedirs(os.path.join(".", "outputs", "epoch"), exist_ok=True)  # Ensure output directory exists
 
     def train(self):
+        with open(os.path.join(".", "outputs", "epoch", "best-model-log.txt"), "w") as f:
+            f.write(f"Start time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         for epoch in range(self.num_epochs):
             # Training phase
             train_loss = self.train_epoch(epoch)
@@ -100,6 +103,9 @@ class BERT2Trainer:
                 self.best_loss = valid_loss
                 torch.save(self.model.state_dict(), self.model_save_path)
                 print(f"Saved best model with validation loss: {valid_loss:.4f}")
+                with open(os.path.join(".", "outputs", "epoch", "best-model-log.txt"), "a") as f:
+                    f.write(f"epoch {epoch + 1}\n")
+                    f.write(f"train loss: {train_loss:.4f}, valid loss: {valid_loss:.4f}\n")
                 
         print("Training completed!")
         wandb.finish()  # Finish wandb run
@@ -336,7 +342,7 @@ if __name__ == "__main__":
         mlm_valid_loader=mlm_valid_loader,
         anp_valid_loader=anp_valid_loader,
         num_epochs=args.epochs,
-        model_save_path=os.path.join(data_dir, "outputs", f"best-model.pth"),
+        model_save_path=os.path.join(data_dir, "outputs", "epoch", f"best-model.pth"),
         device=args.device,
     )
     if args.wandb_run:

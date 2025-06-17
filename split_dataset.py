@@ -28,7 +28,7 @@ def split_functions():
         compiler = next((c for c in ["gcc", "clang"] if c in parts), "unknown")
         version = next((v for v in parts if re.match(r"\d+(\.\d+)?", v)), "unknown")
         opt = next((o for o in ["O0", "O1", "O2", "O3", "Os"] if o in parts), "unknown")
-        return compiler, version, opt, file_name
+        return compiler, str(float(version)), opt, file_name
 
     function_list = []
 
@@ -53,79 +53,83 @@ def split_functions():
         with open(os.path.join(OUTPUT_DIR, f"baseline-{split}-functions.pkl"), "wb") as f:
             pickle.dump(data, f)
 
-    # Step 6: generate function_pool.csv (pairwise combinations in test set)
-    pairs = []
-    # Convert test set to list of dicts for easier handling
-    test_dicts = [
-        {
-            "function_name": fn,
-            "compiler": comp,
-            "version": ver,
-            "opt": opt,
-            "file_name": file_name
-        }
-        for fn, comp, ver, opt, file_name in test
-    ]
-    # Group by (function_name)
-    grouped = defaultdict(list)
-    for item in test_dicts:
-        grouped[item["function_name"]].append(item)
-    # delete items with less than 2 functions
-    grouped = {k: v for k, v in grouped.items() if len(v) >= 2}
+    # Step 6: generate similarity pairs and labels
+    for split, functions in zip(["train", "val", "test"], [train, val, test]):
+        pairs = []
+        # Convert test set to list of dicts for easier handling
+        function_dicts = [
+            {
+                "function_name": fn,
+                "compiler": comp,
+                "version": ver,
+                "opt": opt,
+                "file_name": file_name
+            }
+            for fn, comp, ver, opt, file_name in functions
+        ]
+        # Group by (function_name)
+        grouped = defaultdict(list)
+        for item in function_dicts:
+            grouped[item["function_name"]].append(item)
+        # delete items with less than 2 functions
+        grouped = {k: v for k, v in grouped.items() if len(v) >= 2}
 
-    for a_func, a_group in grouped.items():
-        # Generate positive pairs: all pairs within the group
-        positive_pairs_count = 0
-        negative_pairs_count = 0
-        for a, b in combinations(a_group, 2):
-            pairs.append({
-                "anchor_function_file": a["file_name"],
-                "anchor_function_name": a["function_name"],
-                "anchor_compiler": a["compiler"],
-                "anchor_version": a["version"],
-                "anchor_opt": a["opt"],
-                "target_function_file": b["file_name"],
-                "target_function_name": b["function_name"],
-                "target_compiler": b["compiler"],
-                "target_version": b["version"],
-                "target_opt": b["opt"],
-                "label": 1  # Positive pair
-            })
-            positive_pairs_count += 1
-        # Generate negative pairs: randomly pick one from this group, one from each other group
-        b_funcs = [k for k in grouped.keys() if k != a_func]
-        random.shuffle(b_funcs)  # Shuffle to ensure randomness
-        while negative_pairs_count < positive_pairs_count and len(b_funcs) > 0:
-            a_idx = random.randint(0, len(a_group) - 1)
-            a = a_group[a_idx]
-            b_func = b_funcs.pop()
-            b_group = grouped[b_func]
-            b_idx = random.randint(0, len(b_group) - 1)
-            b = b_group[b_idx]
-            pairs.append({
-                "anchor_function_file": a["file_name"],
-                "anchor_function_name": a["function_name"],
-                "anchor_compiler": a["compiler"],
-                "anchor_version": a["version"],
-                "anchor_opt": a["opt"],
-                "target_function_file": b["file_name"],
-                "target_function_name": b["function_name"],
-                "target_compiler": b["compiler"],
-                "target_version": b["version"],
-                "target_opt": b["opt"],
-                "label": 0  # Negative pair
-            })
-            negative_pairs_count += 1
+        for a_func, a_group in grouped.items():
+            # Generate positive pairs: all pairs within the group
+            positive_pairs = []
+            negative_pairs = []
+            for a, b in combinations(a_group, 2):
+                positive_pairs.append({
+                    "anchor_function_file": a["file_name"],
+                    "anchor_function_name": a["function_name"],
+                    "anchor_compiler": a["compiler"],
+                    "anchor_version": a["version"],
+                    "anchor_opt": a["opt"],
+                    "target_function_file": b["file_name"],
+                    "target_function_name": b["function_name"],
+                    "target_compiler": b["compiler"],
+                    "target_version": b["version"],
+                    "target_opt": b["opt"],
+                    "label": 1  # Positive pair
+                })
+            # Randomly sample positive pairs to limit the number
+            # of pairs per function to 5
+            sampled_positive_pairs = random.sample(positive_pairs, min(len(positive_pairs), 5))
+            pairs.extend(sampled_positive_pairs)
+            # Generate negative pairs: randomly pick one from this group, one from each other group
+            b_funcs = [k for k in grouped.keys() if k != a_func]
+            random.shuffle(b_funcs)  # Shuffle to ensure randomness
+            while len(b_funcs) > 0 and len(negative_pairs) < len(sampled_positive_pairs):
+                a_idx = random.randint(0, len(a_group) - 1)
+                a = a_group[a_idx]
+                b_func = b_funcs.pop()
+                b_group = grouped[b_func]
+                b_idx = random.randint(0, len(b_group) - 1)
+                b = b_group[b_idx]
+                negative_pairs.append({
+                    "anchor_function_file": a["file_name"],
+                    "anchor_function_name": a["function_name"],
+                    "anchor_compiler": a["compiler"],
+                    "anchor_version": a["version"],
+                    "anchor_opt": a["opt"],
+                    "target_function_file": b["file_name"],
+                    "target_function_name": b["function_name"],
+                    "target_compiler": b["compiler"],
+                    "target_version": b["version"],
+                    "target_opt": b["opt"],
+                    "label": 0  # Negative pair
+                })
+            pairs.extend(negative_pairs)
 
-    # Step 7: save CSV
-    pd.DataFrame(pairs).to_csv(os.path.join(OUTPUT_DIR, "function_pool.csv"), index=False)
+        # Step 7: save CSV
+        pd.DataFrame(pairs).to_csv(os.path.join(OUTPUT_DIR, f"{split}-function_pool.csv"), index=False)
 
 import json
 # Define the function to process a single split
 def process_split_datasets(split):
-    if split == "test":
-        function_name_idx_map = {}
-        count = 0
+
+    function_name_idx_map = {}
+    count = 0
     output_path = os.path.join(OUTPUT_DIR, f"baseline-{split}.jsonl")
     if(os.path.exists(output_path)):
         os.remove(output_path)
@@ -163,16 +167,14 @@ def process_split_datasets(split):
                     'data': adj.data.tolist(),
                     'shape': adj.shape
                 }
-                if split != "test":
-                    out_file.write(json.dumps(output_obj, ensure_ascii=False) + '\n')
-                else:
-                    key = (function_name, compiler, version, opt, file_name)
-                    function_name_idx_map[key] = count
-                    count += 1
-                    out_file.write(json.dumps(output_obj, ensure_ascii=False) + '\n')
-    if split == "test":
-        with open(os.path.join(OUTPUT_DIR, f"baseline-{split}-function_name_idx_map.pkl"), "wb") as f:
-            pickle.dump(function_name_idx_map, f)
+
+                key = (function_name, compiler, version, opt, file_name)
+                function_name_idx_map[key] = count
+                count += 1
+                out_file.write(json.dumps(output_obj, ensure_ascii=False) + '\n')
+
+    with open(os.path.join(OUTPUT_DIR, f"{split}-function-idx-mapping.pkl"), "wb") as f:
+        pickle.dump(function_name_idx_map, f)
 
 from multiprocessing import Process
 if __name__ == '__main__':
@@ -192,14 +194,14 @@ if __name__ == '__main__':
         p.join()
     
     # build vocab
-    vocab = {"<PAD>": 0, "<CLS>": 1, "<SEP>": 2, "<MASK>": 3, "<UNK>": 4, "<const>": 5}
-    from datasets import load_dataset
-    tokenizer = AsmTokenizer(vocab_file=os.path.join(OUTPUT_DIR, "baseline-vocab.txt"))
-    tokenizer.vocab = vocab  # Use the predefined vocab
-    for dataset_name in ["baseline-train", "baseline-val", "baseline-test"]:
-        dataset_path = os.path.join(".", "outputs", f"{dataset_name}.jsonl")
-        dataset = load_dataset('json', data_files=dataset_path, split="train", streaming=True)
-        for data in dataset:
-                tokenizer.build_vocab(data['instruction_blocks'])
-    # Save vocab to file
-    tokenizer.save_vocab(os.path.join(OUTPUT_DIR, "baseline-vocab.txt"))
+    # vocab = {"<PAD>": 0, "<CLS>": 1, "<SEP>": 2, "<MASK>": 3, "<UNK>": 4, "<const>": 5}
+    # from datasets import load_dataset
+    # tokenizer = AsmTokenizer(vocab_file=os.path.join(OUTPUT_DIR, "baseline-vocab.txt"))
+    # tokenizer.vocab = vocab  # Use the predefined vocab
+    # for dataset_name in ["baseline-train", "baseline-val", "baseline-test"]:
+    #     dataset_path = os.path.join(".", "outputs", f"{dataset_name}.jsonl")
+    #     dataset = load_dataset('json', data_files=dataset_path, split="train", streaming=True)
+    #     for data in dataset:
+    #             tokenizer.build_vocab(data['instruction_blocks'])
+    # # Save vocab to file
+    # tokenizer.save_vocab(os.path.join(OUTPUT_DIR, "baseline-vocab.txt"))

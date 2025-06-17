@@ -250,7 +250,7 @@ def process_binary_file(args):
             # First, check the number of basic blocks
             blocks = list(func.blocks)
             n_blocks = len(blocks)
-            if n_blocks <= 5:
+            if n_blocks <= 5 or n_blocks > 1000:
                 continue
             
             # Initialize function entry

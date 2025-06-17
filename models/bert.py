@@ -612,20 +612,20 @@ class OrderCNN(nn.Module):
 class SemanticAwareModel(nn.Module):
     """
     Complete semantic-aware model integrating three components:
-    1. Semantic-aware modeling (BERT4)
+    1. Semantic-aware modeling (BERT)
     2. Structure-aware modeling (MPNN)
     3. Order-aware modeling (OrderCNN)
     """
-    def __init__(self, bert4_model, d_model=128, hidden_dim=64, device="cuda"):
+    def __init__(self, bert_model, d_model=128, hidden_dim=64, device="cuda"):
         """
-        :param bert4_model: Pretrained BERT4 model
-        :param d_model: Output embedding dimension of BERT4
+        :param bert_model: Pretrained BERT model
+        :param d_model: Output embedding dimension of BERT
         :param hidden_dim: Final graph embedding dimension
         :param device: Computing device
         """
         super().__init__()
         self.device = device
-        self.bert4 = bert4_model
+        self.bert = bert_model
         
         # Structure-aware modeling component
         self.mpnn = MPNN(in_dim=d_model, hidden_dim=d_model, n_steps=5)
@@ -655,7 +655,7 @@ class SemanticAwareModel(nn.Module):
         flat_input_ids = input_ids.reshape(batch_size * num_nodes, seq_len)
         
         # Get block embeddings [batch_size * num_nodes, d_model]
-        block_embeddings = self.bert4.encode(flat_input_ids)
+        block_embeddings = self.bert.encode(flat_input_ids)
         
         # Restore node dimension [batch_size, num_nodes, d_model]
         node_features = block_embeddings.reshape(batch_size, num_nodes, -1)

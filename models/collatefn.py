@@ -15,10 +15,8 @@ class MLMCollateFn:
         for batch in batches:
             instruction_blocks = batch["instruction_blocks"]
             mlm_dataset = BERTMLMDataset(instruction_blocks, self.tokenizer, max_len=self.seq_len, train=self.train)
-            # Only take one sample per graph to avoid data imbalance
             if len(mlm_dataset) > 0:
                 n_samples = min(len(mlm_dataset), self.samples_per_batch)
-
                 idx_set = random.sample(range(len(mlm_dataset)), n_samples)
                 for idx in idx_set:
                     ids, labels = mlm_dataset[idx]
@@ -51,7 +49,6 @@ class ANPCollateFn:
             instruction_blocks = batch["instruction_blocks"]
             adj = batch["adjacency_matrix"]
             anp_dataset = BERTANPDataset(instruction_blocks, self.tokenizer, adj, max_len=self.seq_len)
-            # Only take one sample per graph to avoid data imbalance
             if len(anp_dataset) > 0:
                 n_samples = min(len(anp_dataset), self.samples_per_batch)
                 half = len(anp_dataset) // 2
