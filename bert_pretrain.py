@@ -12,7 +12,7 @@ from models.collatefn import MLMCollateFn, ANPCollateFn, CombinedCollateFn
 import wandb
 import time
 
-class BERT2Trainer:
+class BERT2PretrainTrainer:
     def __init__(
         self,
         model,
@@ -262,8 +262,8 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cuda", dest="device")
     parser.add_argument("--epochs", type=int, default=10, dest="epochs")
     parser.add_argument("--batch_size", type=int, default=20, dest="batch_size")
-    parser.add_argument("--wandb_project", default="bert2-pretraining", help="Weights & Biases project name")
-    parser.add_argument("--wandb_run", default="experiment-1", help="Weights & Biases run name")
+    parser.add_argument("--wandb_project", default="bert2-training", help="Weights & Biases project name")
+    parser.add_argument("--wandb_run", default="bert2-pretraining", help="Weights & Biases run name")
     args = parser.parse_args()
     seq_len = 128
     data_dir = "."
@@ -335,7 +335,7 @@ if __name__ == "__main__":
     )
 
     # Create trainers
-    trainer = BERT2Trainer(
+    trainer = BERT2PretrainTrainer(
         model=bert_model,
         mlm_train_loader=mlm_train_loader,
         anp_train_loader=anp_train_loader,

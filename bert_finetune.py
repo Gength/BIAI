@@ -19,10 +19,189 @@ class Config:
     lr = 1e-4
     epochs = 10
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    bert_checkpoint = vocab_file=os.path.join(".", "outputs", "epoch", "bert2-best.pth")  # Pretrained BERT path
+    bert_checkpoint = os.path.join(".", "outputs", "epoch", "bert2-best.pth")  # Pretrained BERT path
     save_path = os.path.join(".", "outputs", "CFGFusion-best.pth")  # best Model save path
+    use_amp = True  # Use Automatic Mixed Precision (AMP) if available
 
 config = Config()
+
+class BERT2FinetuneTrainer:
+    def __init__(
+        self,
+        model,
+        train_loader,
+        val_loader,
+        lr=1e-4,
+        log_freq=10,
+        num_epochs=10,
+        model_save_path="",
+        device="cuda",
+        use_amp=True,
+    ):
+        self.device = device
+        self.model = model.to(device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.log_freq = log_freq
+        self.num_epochs = num_epochs
+        self.model_save_path = model_save_path
+        self.use_amp = use_amp
+        self.best_accuracy = 0
+        self.best_val_loss = float('inf')
+        
+        # Optimizer and loss function
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.criterion = nn.BCEWithLogitsLoss()
+        
+        # Learning rate scheduler
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='min',
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6
+        )
+        
+        # Mixed precision training
+        if use_amp:
+            self.scaler = torch.amp.GradScaler('cuda')
+        else:
+            self.scaler = None
+        
+        # Initialize wandb
+        wandb.init(
+            project="bert2-training",
+            config={
+                "batch_size": train_loader.batch_size,
+                "learning_rate": lr,
+                "epochs": num_epochs,
+                "device": device
+            }
+        )
+        wandb.run.name = "bert2-finetuning"
+        wandb.watch(self.model, log=None)
+        
+        # Ensure output directory exists
+        os.makedirs(os.path.join(".", "outputs", "epoch"), exist_ok=True)
+
+    def train(self):
+        print(f"Starting training on {self.device}...")
+        for epoch in range(self.num_epochs):
+            print(f"\nEpoch {epoch+1}/{self.num_epochs}")
+            
+            # Training phase
+            train_loss = self.train_epoch(epoch)
+            
+            # Validation phase
+            val_loss, val_acc = self.validate_epoch(epoch)
+            
+            # Update learning rate
+            self.scheduler.step(val_loss)
+            current_lr = self.optimizer.param_groups[0]['lr']
+            print(f"Current learning rate: {current_lr:.8f}")
+            
+            # Log epoch metrics to wandb
+            wandb.log({
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_accuracy": val_acc,
+                "learning_rate": current_lr
+            })
+            
+            # Save best model
+            if val_acc > self.best_accuracy:
+                self.best_accuracy = val_acc
+                torch.save(self.model.state_dict(), self.model_save_path)
+                print(f"Saved new best model with accuracy {val_acc:.4f}")
+            
+            # Save checkpoint
+            save_path = os.path.join(".", "outputs", "epoch", f"CFGFusion-epoch-{epoch}.pth")
+            torch.save(self.model.state_dict(), save_path)
+        
+        print("Training completed!")
+        wandb.finish()
+
+    def train_epoch(self, epoch):
+        self.model.train()
+        total_loss = 0
+        progress = tqdm(
+            self.train_loader, 
+            desc=f"Epoch {epoch+1} Train",
+            total=len(self.train_loader),
+            bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
+        )
+        
+        for i, (a_ids, a_adj, t_ids, t_adj, labels) in enumerate(progress):
+            a_ids, a_adj = a_ids.to(self.device), a_adj.to(self.device)
+            t_ids, t_adj = t_ids.to(self.device), t_adj.to(self.device)
+            labels = labels.to(self.device)
+            
+            with torch.autocast(device_type=self.device, enabled=self.use_amp):
+                outputs = self.model(a_ids, a_adj, t_ids, t_adj)
+                loss = self.criterion(outputs, labels)
+            
+            # Backpropagation
+            self.optimizer.zero_grad()
+            if self.use_amp and self.scaler:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                self.optimizer.step()
+            
+            # Logging
+            total_loss += loss.item()
+            progress.set_postfix(loss=loss.item())
+            
+            if i % self.log_freq == 0:
+                wandb.log({"batch_train_loss": loss.item()})
+        
+        return total_loss / len(self.train_loader)
+
+    def validate_epoch(self, epoch):
+        self.model.eval()
+        total_loss = 0
+        correct = 0
+        total = 0
+        progress = tqdm(
+            self.val_loader, 
+            desc=f"Epoch {epoch+1} Valid",
+            total=len(self.val_loader),
+            bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
+        )
+        
+        with torch.no_grad():
+            for i, (a_ids, a_adj, t_ids, t_adj, labels) in enumerate(progress):
+                a_ids, a_adj = a_ids.to(self.device), a_adj.to(self.device)
+                t_ids, t_adj = t_ids.to(self.device), t_adj.to(self.device)
+                labels = labels.to(self.device)
+                
+                outputs = self.model(a_ids, a_adj, t_ids, t_adj)
+                loss = self.criterion(outputs, labels)
+                
+                # Calculate accuracy
+                probs = torch.sigmoid(outputs)
+                predictions = (probs > 0.5).float()
+                correct += (predictions.to(torch.int32) == labels.to(torch.int32)).sum().item()
+                total += labels.size(0)
+                
+                # Logging
+                total_loss += loss.item()
+                accuracy = correct / total if total > 0 else 0
+                progress.set_postfix(loss=loss.item(), accuracy=accuracy)
+                
+                if i % self.log_freq == 0:
+                    wandb.log({
+                        "batch_val_loss": loss.item(),
+                        "batch_val_accuracy": accuracy
+                    })
+        
+        avg_loss = total_loss / len(self.val_loader)
+        accuracy = correct / total
+        print(f"Val Loss: {avg_loss:.4f}, Val Acc: {accuracy:.4f}")
+        return avg_loss, accuracy
 
 # Initialize model
 def init_model(vocab_size):
@@ -47,79 +226,7 @@ def init_model(vocab_size):
     
     return SimilarityClassifier(cfgfusion_model, config.hidden_dim).to(config.device)
 
-# Update training function to use AMP
-def train(model, dataloader, optimizer, criterion, scaler=None, log_freq = 10):  # Add scaler argument
-    model.train()
-    total_loss = 0
-    progress = tqdm(dataloader, desc="Training")
-    for i, (a_ids, a_adj, t_ids, t_adj, labels) in enumerate(progress):
-        a_ids, a_adj = a_ids.to(config.device), a_adj.to(config.device)
-        t_ids, t_adj = t_ids.to(config.device), t_adj.to(config.device)
-        labels = labels.to(config.device)
-        
-        # Enable autocast for forward pass
-        with torch.autocast(device_type="cuda"):
-            outputs = model(a_ids, a_adj, t_ids, t_adj)
-            loss = criterion(outputs, labels)
-        optimizer.zero_grad()
-        if scaler is not None:
-            # Scale loss and backpropagate
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            # Regular backpropagation
-            loss.backward()
-            optimizer.step()
-        if i % log_freq == 0:
-            # Log current batch loss
-            wandb.log({"batch_loss": loss.item()})
-        total_loss += loss.item()
-        progress.set_postfix(loss=loss.item())
-    
-    return total_loss / len(dataloader)
-
-# Validation function
-def validate(model, dataloader, criterion):
-    model.eval()
-    total_loss = 0
-    correct = 0
-    total = 0
-    
-    with torch.no_grad():
-        for a_ids, a_adj, t_ids, t_adj, labels in dataloader:
-            a_ids, a_adj = a_ids.to(config.device), a_adj.to(config.device)
-            t_ids, t_adj = t_ids.to(config.device), t_adj.to(config.device)
-            labels = labels.to(config.device)
-            
-            outputs = model(a_ids, a_adj, t_ids, t_adj)
-            loss = criterion(outputs, labels)
-            total_loss += loss.item()
-            # add sigmoid activation for binary classification
-            probs = torch.sigmoid(outputs)
-            # Calculate accuracy
-            predictions = (probs > 0.5).float()
-            correct += (predictions.to(torch.int32) == labels.to(torch.int32)).sum().item()
-            total += labels.size(0)
-    
-    accuracy = correct / total
-    return total_loss / len(dataloader), accuracy
-
 if __name__ == "__main__":
-    os.makedirs(os.path.join(".", "outputs", "epoch"), exist_ok=True)
-    # Initialize wandb
-    wandb.init(
-        project="bert2-training",  # Project name
-        config={
-            "batch_size": config.batch_size,
-            "learning_rate": config.lr,
-            "epochs": config.epochs,
-            "max_blocks": config.max_blocks,
-            "seq_len": config.seq_len,
-            "hidden_dim": config.hidden_dim
-        }
-    )
-    wandb.run.name = "bert2-finetuning"  # Set run name
     # Initialize tokenizer to get vocab size
     tokenizer = AsmTokenizer(vocab_file="outputs/baseline-vocab.txt")
     vocab_size = len(tokenizer.vocab)
@@ -149,8 +256,8 @@ if __name__ == "__main__":
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=4,
-        prefetch_factor=2,  # Prefetch data for faster loading
-        persistent_workers=True,  # Keep workers alive for faster subsequent epochs
+        prefetch_factor=2,
+        persistent_workers=True,
         pin_memory=True
     )
     
@@ -159,68 +266,21 @@ if __name__ == "__main__":
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=2,
-        prefetch_factor=2,  # Prefetch data for faster loading
-        persistent_workers=True,  # Keep workers alive for faster subsequent epochs
+        prefetch_factor=2,
+        persistent_workers=True,
         pin_memory=True
     )
     
-    # Initialize model
+    # Initialize model and trainer
     model = init_model(vocab_size)
-    wandb.watch(model, log=None)  # Monitor model parameters
-    optimizer = optim.Adam(model.parameters(), lr=config.lr)
-    criterion = nn.BCEWithLogitsLoss() # Binary cross-entropy
-    scaler = torch.amp.GradScaler('cuda')
-    # Add learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='min',          # Monitor validation loss minimization
-        factor=0.5,          # Learning rate decay factor
-        patience=3,          # Reduce learning rate after 3 epochs without improvement
-        min_lr=1e-6          # Minimum learning rate
+    trainer = BERT2FinetuneTrainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        lr=config.lr,
+        num_epochs=config.epochs,
+        model_save_path=config.save_path,
+        device=config.device,
+        use_amp=config.use_amp
     )
-    
-    best_accuracy = 0
-    best_val_loss = float('inf')
-    print(f"Starting training on {config.device}...")
-    
-    for epoch in range(config.epochs):
-        print(f"\nEpoch {epoch+1}/{config.epochs}")
-        
-        # Compute average epoch loss
-        train_loss = train(model, train_loader, optimizer, criterion, scaler)
-        print(f"Train Loss: {train_loss:.4f}")
-        
-        # Validation phase
-        val_loss, val_acc = validate(model, val_loader, criterion)
-        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-        
-        # Update learning rate
-        scheduler.step(val_loss)
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"Current learning rate: {current_lr:.8f}")
-        
-        # Log epoch metrics to wandb
-        wandb.log({
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "val_accuracy": val_acc,
-            "learning_rate": current_lr
-        })
-        
-        # Save best model
-        if val_acc > best_accuracy:
-            best_accuracy = val_acc
-            torch.save(model.state_dict(), config.save_path)
-            print(f"Saved new best model with accuracy {val_acc:.4f}")
-        save_path = os.path.join(".", "outputs", "epoch", f"CFGFusion-epoch-{epoch}.pth")
-        torch.save(model.state_dict(), save_path)
-        
-        # Save model with lowest validation loss
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            # Optionally save a separate checkpoint, here using the same file
-            # Or use torch.save(model.state_dict(), "best_val_loss_model.pth")
-    
-    print("Training completed!")
-    wandb.finish()  # End wandb run
+    trainer.train()
