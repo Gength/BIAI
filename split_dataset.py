@@ -94,7 +94,13 @@ def split_functions():
                 })
             # Randomly sample positive pairs to limit the number
             # of pairs per function to 5
-            sampled_positive_pairs = random.sample(positive_pairs, min(len(positive_pairs), 5))
+            if split == "train":
+                sample_counts = 5
+            elif split == "val":
+                sample_counts = 2
+            else:  # test
+                sample_counts = 3
+            sampled_positive_pairs = random.sample(positive_pairs, min(len(positive_pairs), sample_counts))
             pairs.extend(sampled_positive_pairs)
             # Generate negative pairs: randomly pick one from this group, one from each other group
             b_funcs = [k for k in grouped.keys() if k != a_func]

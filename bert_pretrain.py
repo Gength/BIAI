@@ -11,7 +11,18 @@ from models.dataset import TaskDataset
 from models.collatefn import MLMCollateFn, ANPCollateFn, CombinedCollateFn
 import wandb
 import time
-
+class Config:
+    batch_size = 30  # RTX 4080: 10, A40: 30
+    epochs = 8
+    seq_len = 128    # Maximum sequence length
+    lr = 1e-4
+    epochs = 8
+    device = "cuda"
+    checkpoint_save_path = os.path.join("outputs", "bert-pretrain")
+    use_amp = True  # Use Automatic Mixed Precision (AMP) if available
+    wandb_run = "bert2-pretrain"  # Weights & Biases run name
+    wandb_project = "bert2-training"  # Weights & Biases project name
+config = Config()
 class BERT2PretrainTrainer:
     def __init__(
         self,
@@ -24,7 +35,7 @@ class BERT2PretrainTrainer:
         weight_decay=0.01,
         betas=(0.9, 0.999),
         log_freq=10,
-        num_epochs=20,
+        num_epochs=10,
         model_save_path="",
         device="cuda",
         use_amp=True,
@@ -45,14 +56,19 @@ class BERT2PretrainTrainer:
         total_steps = max(len(mlm_train_loader), len(anp_train_loader)) * num_epochs
         
         # Single learning rate scheduler
-        self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
+        self.optim_schedule = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optim,
-            max_lr=1e-3,
-            total_steps=total_steps,
-            pct_start=0.1,
-            anneal_strategy="cos",
-            final_div_factor=1e2,
+            T_max=total_steps,
+            eta_min=1e-6  # 最低学习率
         )
+        # self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
+        #     self.optim,
+        #     max_lr=1e-4,
+        #     total_steps=total_steps,
+        #     pct_start=0.1,
+        #     anneal_strategy="cos",
+        #     final_div_factor=1e2,
+        # )
 
         self.log_freq = log_freq
         self.best_loss = float('inf')
@@ -73,16 +89,17 @@ class BERT2PretrainTrainer:
         })
         wandb.watch(self.model, log=None)
 
-        if os.path.exists(os.path.join(".", "outputs", "epoch")):
-            file_list = os.listdir(os.path.join(".", "outputs", "epoch"))
-            for file_name in file_list:
-                if os.path.isfile(os.path.join(".", "outputs", "epoch", file_name)):
-                    os.remove(os.path.join(".", "outputs", "epoch", file_name))  # Clear previous epoch files
-        else:
-            os.makedirs(os.path.join(".", "outputs", "epoch"), exist_ok=True)  # Ensure output directory exists
+        # if os.path.exists(os.path.join(".", "outputs", "epoch")):
+        #     file_list = os.listdir(os.path.join(".", "outputs", "epoch"))
+        #     for file_name in file_list:
+        #         if os.path.isfile(os.path.join(".", "outputs", "epoch", file_name)):
+        #             os.remove(os.path.join(".", "outputs", "epoch", file_name))  # Clear previous epoch files
+        # else:
+        #     os.makedirs(os.path.join(".", "outputs", "epoch"), exist_ok=True)  # Ensure output directory exists
+        os.makedirs(self.model_save_path, exist_ok=True)
 
     def train(self):
-        with open(os.path.join(".", "outputs", "epoch", "best-model-log.txt"), "w") as f:
+        with open(os.path.join(".", "outputs", "bert-pretrain-epoch", "best-model-log.txt"), "w") as f:
             f.write(f"Start time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         for epoch in range(self.num_epochs):
             # Training phase
@@ -97,15 +114,14 @@ class BERT2PretrainTrainer:
                 "train_loss": train_loss,
                 "valid_loss": valid_loss,
             })
-            torch.save(self.model.state_dict(), os.path.join(".", "outputs", "epoch", f"bert2-epoch-{epoch+1}.pth"))  # Save model after each epoch
+            checkpoint_path = os.path.join(self.model_save_path, f"bert2-epoch-{epoch+1}.pth")
+            torch.save(self.model.state_dict(), checkpoint_path)  # Save model after each epoch
             # Save the best model
             if valid_loss < self.best_loss:
                 self.best_loss = valid_loss
-                torch.save(self.model.state_dict(), self.model_save_path)
+                model_save_path = os.path.join(self.model_save_path, "bert2-best.pth")
+                torch.save(self.model.state_dict(), model_save_path)
                 print(f"Saved best model with validation loss: {valid_loss:.4f}")
-                with open(os.path.join(".", "outputs", "epoch", "best-model-log.txt"), "a") as f:
-                    f.write(f"epoch {epoch + 1}\n")
-                    f.write(f"train loss: {train_loss:.4f}, valid loss: {valid_loss:.4f}\n")
                 
         print("Training completed!")
         wandb.finish()  # Finish wandb run
@@ -130,8 +146,6 @@ class BERT2PretrainTrainer:
         )
         
         for i in data_iter:
-
-            
             # Prepare MLM task batch
             try:
                 mlm_batch = next(mlm_iter)
@@ -257,15 +271,6 @@ class dummy_context:
         pass
 
 if __name__ == "__main__":
-    # Add wandb parameters before parsing arguments
-    parser = argparse.ArgumentParser(description="Command line parameters")
-    parser.add_argument("--device", default="cuda", dest="device")
-    parser.add_argument("--epochs", type=int, default=10, dest="epochs")
-    parser.add_argument("--batch_size", type=int, default=20, dest="batch_size")
-    parser.add_argument("--wandb_project", default="bert2-training", help="Weights & Biases project name")
-    parser.add_argument("--wandb_run", default="bert2-pretraining", help="Weights & Biases run name")
-    args = parser.parse_args()
-    seq_len = 128
     data_dir = "."
 
     tokenizer = AsmTokenizer(
@@ -302,8 +307,8 @@ if __name__ == "__main__":
     anp_valid_dataset = TaskDataset(valid_dataset, "anp")
     
     # Create collate functions
-    mlm_collate = MLMCollateFn(tokenizer, seq_len, train=True)
-    anp_collate = ANPCollateFn(tokenizer, seq_len)
+    mlm_collate = MLMCollateFn(tokenizer, config.seq_len, train=True)
+    anp_collate = ANPCollateFn(tokenizer, config.seq_len)
     combined_collate = CombinedCollateFn(mlm_collate, anp_collate)
 
     # Create data loaders
@@ -311,18 +316,18 @@ if __name__ == "__main__":
         return DataLoader(
             dataset,
             batch_size=batch_size,
-            num_workers=4,
-            prefetch_factor=2,
+            num_workers=6,
+            prefetch_factor=3,
             persistent_workers=True,
             pin_memory=True,
             collate_fn=collate_fn,
             shuffle=True
         )
     
-    mlm_train_loader = create_dataloader(mlm_train_dataset, args.batch_size, combined_collate)
-    anp_train_loader = create_dataloader(anp_train_dataset, args.batch_size, combined_collate)
-    mlm_valid_loader = create_dataloader(mlm_valid_dataset, args.batch_size, combined_collate)
-    anp_valid_loader = create_dataloader(anp_valid_dataset, args.batch_size, combined_collate)
+    mlm_train_loader = create_dataloader(mlm_train_dataset, config.batch_size, combined_collate)
+    anp_train_loader = create_dataloader(anp_train_dataset, config.batch_size, combined_collate)
+    mlm_valid_loader = create_dataloader(mlm_valid_dataset, config.batch_size, combined_collate)
+    anp_valid_loader = create_dataloader(anp_valid_dataset, config.batch_size, combined_collate)
     
     # Create model
     bert_model = BERT2(
@@ -330,9 +335,13 @@ if __name__ == "__main__":
         d_model=128,
         n_layers=12,
         heads=8,
-        seq_len=seq_len,
-        device=args.device
+        seq_len=config.seq_len,
+        device=config.device
     )
+    # Load pretrained weights
+    bert_model.load_state_dict(torch.load(os.path.join(data_dir, "outputs", "bert-pretrain-epoch-8", "bert2-best.pth")))
+    # convert model to float32
+    bert_model = bert_model.float()
 
     # Create trainers
     trainer = BERT2PretrainTrainer(
@@ -341,10 +350,11 @@ if __name__ == "__main__":
         anp_train_loader=anp_train_loader,
         mlm_valid_loader=mlm_valid_loader,
         anp_valid_loader=anp_valid_loader,
-        num_epochs=args.epochs,
-        model_save_path=os.path.join(data_dir, "outputs", "epoch", f"bert2-best.pth"),
-        device=args.device,
+        num_epochs=config.epochs,
+        model_save_path=config.checkpoint_save_path,
+        device=config.device,
+        use_amp=config.use_amp
     )
-    if args.wandb_run:
-        wandb.run.name = args.wandb_run
+    if config.wandb_run:
+        wandb.run.name = config.wandb_run
     trainer.train()

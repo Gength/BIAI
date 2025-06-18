@@ -5,6 +5,9 @@ import re
 from scipy.sparse import lil_matrix
 import json
 
+MAX_INSTRUCTION_BLOCK_SIZE = 1000  # Maximum number of instructions per block
+MIN_INSTRUCTION_BLOCK_SIZE = 6  # Minimum number of instructions per block
+
 with open("opcode_categories.json", "r") as f:
     OPCODE_CATEGORIES = json.load(f)
 with open("register_types.json", "r") as f:
@@ -250,7 +253,7 @@ def process_binary_file(args):
             # First, check the number of basic blocks
             blocks = list(func.blocks)
             n_blocks = len(blocks)
-            if n_blocks <= 5 or n_blocks > 1000:
+            if n_blocks < MIN_INSTRUCTION_BLOCK_SIZE or n_blocks > MAX_INSTRUCTION_BLOCK_SIZE:
                 continue
             
             # Initialize function entry

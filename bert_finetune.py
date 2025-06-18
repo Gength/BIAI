@@ -12,18 +12,21 @@ from models.dataset import FunctionPairDataset
 
 # Configuration parameters
 class Config:
-    batch_size = 7
+    batch_size = 25  # RTX 4080: 7, A40: 25
     max_blocks = 50  # Maximum number of basic blocks
     seq_len = 128    # Maximum sequence length
     hidden_dim = 64  # Graph embedding dimension
     lr = 1e-4
-    epochs = 10
+    epochs = 8
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    bert_checkpoint = os.path.join(".", "outputs", "epoch", "bert2-best.pth")  # Pretrained BERT path
-    save_path = os.path.join(".", "outputs", "CFGFusion-best.pth")  # best Model save path
+    bert_checkpoint = os.path.join(".", "outputs", "bert-pretrain-epoch-8", "bert2"
+    "-best.pth")  # Pretrained BERT path
+    checkpoint_save_path = os.path.join(".", "outputs", "bert-finetune-epoch")  # Checkpoint save path
     use_amp = True  # Use Automatic Mixed Precision (AMP) if available
-
+    wandb_run = "bert2-finetune"  # Weights & Biases run name
+    wandb_project = "bert2-training"  # Weights & Biases project name
 config = Config()
+
 
 class BERT2FinetuneTrainer:
     def __init__(
@@ -70,7 +73,7 @@ class BERT2FinetuneTrainer:
         
         # Initialize wandb
         wandb.init(
-            project="bert2-training",
+            project=config.wandb_project,
             config={
                 "batch_size": train_loader.batch_size,
                 "learning_rate": lr,
@@ -78,11 +81,11 @@ class BERT2FinetuneTrainer:
                 "device": device
             }
         )
-        wandb.run.name = "bert2-finetuning"
+        wandb.run.name = config.wandb_run
         wandb.watch(self.model, log=None)
         
         # Ensure output directory exists
-        os.makedirs(os.path.join(".", "outputs", "epoch"), exist_ok=True)
+        os.makedirs(config.checkpoint_save_path, exist_ok=True)
 
     def train(self):
         print(f"Starting training on {self.device}...")
@@ -97,7 +100,7 @@ class BERT2FinetuneTrainer:
             
             # Update learning rate
             self.scheduler.step(val_loss)
-            current_lr = self.optimizer.param_groups[0]['lr']
+            current_lr = self.scheduler.get_last_lr()[0]
             print(f"Current learning rate: {current_lr:.8f}")
             
             # Log epoch metrics to wandb
@@ -112,12 +115,13 @@ class BERT2FinetuneTrainer:
             # Save best model
             if val_acc > self.best_accuracy:
                 self.best_accuracy = val_acc
-                torch.save(self.model.state_dict(), self.model_save_path)
+                model_save_path = os.path.join(self.model_save_path, "CFGFusion-best.pth")
+                torch.save(self.model.state_dict(), model_save_path)
                 print(f"Saved new best model with accuracy {val_acc:.4f}")
             
             # Save checkpoint
-            save_path = os.path.join(".", "outputs", "epoch", f"CFGFusion-epoch-{epoch}.pth")
-            torch.save(self.model.state_dict(), save_path)
+            checkpoint_save_path = os.path.join(self.checkpoint_save_path, f"CFGFusion-epoch-{epoch}.pth")
+            torch.save(self.model.state_dict(), checkpoint_save_path)
         
         print("Training completed!")
         wandb.finish()
@@ -255,8 +259,8 @@ if __name__ == "__main__":
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=4,
-        prefetch_factor=2,
+        num_workers=8,
+        prefetch_factor=4,
         persistent_workers=True,
         pin_memory=True
     )
@@ -265,8 +269,8 @@ if __name__ == "__main__":
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=2,
-        prefetch_factor=2,
+        num_workers=8,
+        prefetch_factor=4,
         persistent_workers=True,
         pin_memory=True
     )
@@ -279,7 +283,7 @@ if __name__ == "__main__":
         val_loader=val_loader,
         lr=config.lr,
         num_epochs=config.epochs,
-        model_save_path=config.save_path,
+        model_save_path=config.checkpoint_save_path,
         device=config.device,
         use_amp=config.use_amp
     )
