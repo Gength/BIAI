@@ -133,13 +133,13 @@
 ```
 ### 多进程批处理
 1. 遍历 Dataset-1 目录下的二进制文件。
-2. 过滤文件名含 x86/x64 和 gcc 的文件。
+2. 选择文件名含 x86/x64 和 gcc 的文件。
 3. 使用 12 进程并行处理：
 4. 合并未知项到 unknown_opcode.json。
 
 ## 数据集划分
 ### 函数级数据集分割 
-1. 遍历所有的pkl文件，为每个函数创建元组：(函数名, 编译器, 版本, 优化级别, 文件名)\ 
+1. 遍历所有的pkl文件，为每个函数创建元组：(函数名, 编译器, 版本, 优化级别, 文件名) \
 示例：('main', 'gcc', '8.32', 'O0', 'coreutils-8.32')
 2. 数据集分割，63%训练集，27%验证集，10%测试集。
 ```python
@@ -151,6 +151,19 @@ train, val = train_test_split(train_val, test_size=0.3)          # 剩余70%训�
    - 正样本对：相同函数不同编译配置
    - 负样本对：不同函数随机配对
    - 采样控制（防止数据爆炸）：训练集每组最多5正5负，验证集每组最多2正2负，测试集每组最多3正3负。
+
+| anchor_function_file                  | anchor_function_name      | anchor_compiler | anchor_version | anchor_opt | target_function_file                  | target_function_name      | target_compiler | target_version | target_opt | label |
+|---------------------------------------|--------------------------|-----------------|---------------|------------|---------------------------------------|--------------------------|-----------------|---------------|------------|-------|
+| x64-gcc-4.8-Os_libclamav.so.9.0.0     | FileInStream_fmap_Seek   | gcc             | 4.8           | Os         | x64-gcc-5-O0_libclamav.so.9.0.0      | FileInStream_fmap_Seek   | gcc             | 5.0           | O0         | 1     |
+| x64-gcc-5-O2_libclamav.so.9.0.0       | FileInStream_fmap_Seek   | gcc             | 5.0           | O2         | x64-gcc-7-O0_libclamav.so.9.0.0      | FileInStream_fmap_Seek   | gcc             | 7.0           | O0         | 1     |
+| x64-gcc-9-O2_libclamav.so.9.0.0       | FileInStream_fmap_Seek   | gcc             | 9.0           | O2         | x86-gcc-5-O3_libclamav.so.9.0.0      | FileInStream_fmap_Seek   | gcc             | 5.0           | O3         | 1     |
+| x86-gcc-9-O1_libclamav.so.9.0.0       | FileInStream_fmap_Seek   | gcc             | 9.0           | O1         | x64-gcc-7-O1_libclamav.so.9.0.0      | FileInStream_fmap_Seek   | gcc             | 7.0           | O1         | 1     |
+| x64-gcc-9-O2_libclamav.so.9.0.0       | FileInStream_fmap_Seek   | gcc             | 9.0           | O2         | x86-gcc-7-O0_libclamav.so.9.0.0      | FileInStream_fmap_Seek   | gcc             | 7.0           | O0         | 1     |
+| x86-gcc-9-O3_libclamav.so.9.0.0       | FileInStream_fmap_Seek   | gcc             | 9.0           | O3         | x64-gcc-9-O0_libssl.so.3             | dtls1_query_mtu          | gcc             | 9.0           | O0         | 0     |
+| x64-gcc-7-O0_libclamav.so.9.0.0       | FileInStream_fmap_Seek   | gcc             | 7.0           | O0         | x86-gcc-7-O2_libclamav.so.9.0.0      | .L68                     | gcc             | 7.0           | O2         | 0     |
+| x86-gcc-7-O0_libclamav.so.9.0.0       | FileInStream_fmap_Seek   | gcc             | 7.0           | O0         | x86-gcc-4.8-Os_ncat                  | executable_path          | gcc             | 4.8           | Os         | 0     |
+| x64-gcc-7-O0_libclamav.so.9.0.0       | FileInStream_fmap_Seek   | gcc             | 7.0           | O0         | x86-gcc-4.8-O0_ncat                  | newbox                   | gcc             | 4.8           | O0         | 0     |
+| x64-gcc-5-O0_libclamav.so.9.0.0       | FileInStream_fmap_Seek   | gcc             | 5.0           | O0         | x86-gcc-4.8-O3_libclamav.so.9.0.0    | sub_793302               | gcc             | 4.8           | O3         | 0     |
 ### 数据集预处理
 1. 加载分割后的函数列表
 2. 按二进制文件分组处理
@@ -192,13 +205,19 @@ adj = {
 
 # BERT2预训练
 ## BERT2模型
-<img src="./picture/deepseek_mermaid_20250620_f37303.png" alt="bert2" width="500"/>\
+<div align="center">
+  <img src="./picture/deepseek_mermaid_20250620_f37303.png" alt="bert2" width="500"/>
+</div>
 
-Dimension for BERT pre-training embedding is 128, Max sequence length for BERT pre-training is 128, transformer depth is 12 and feed-forward dim is 256.
-+ MLM is a token-level task, which masks the tokens on the input layer and predict them on the output layer.
-+ In ANP task, we extract all adjacent blocks on a graph and randomly sample several blocks in the same graph to predict whether two blocks are adjacent.
++ BERT2 Config:
+  - Vocab Embedding Dim: 128
+  - Max Sequence Length: 128
+  - Feed-forward/Hidden Dim: 256
+  - Transformer Depth: 12
+  - Attention Heads: 8 
 
 ## Masked Language Model (MLM) Task
+masks the tokens on the input layer and predict them on the output layer.
 1. 对于每个函数的指令块进行采样，随机采样10个指令块，对每个指令块进行掩码处理，忽略\<SEP\>：
    - 15% 概率替换:
      - 80% 替换为\<MASK\>
@@ -206,6 +225,7 @@ Dimension for BERT pre-training embedding is 128, Max sequence length for BERT p
      - 10% 保持原样
 2. 在每个指令块前后添加\<CLS\>和\<SEP\>标记，用\<PAD\>填充到最大长度。
 ## Adjacency Node prediction Task
+extract all adjacent blocks on a graph and randomly sample several blocks in the same graph to predict whether two blocks are adjacent.
 1. 根据邻接矩阵，生成正负样本对：
    - 正样本对：相邻的基本块对
    - 负样本对：随机选择不相邻的基本块对
@@ -218,3 +238,143 @@ Dimension for BERT pre-training embedding is 128, Max sequence length for BERT p
 - MLM损失：使用交叉熵损失函数计算掩码位置的预测误差，忽略\<PAD\>标记。
 - 邻接预测损失：使用交叉熵损失函数计算正负样本对的预测误差。
 - 总损失：MLM损失 + 邻接预测损失
+
+# Supervised Fine-tuning
+## Model Structure
+![](./picture/20250621-005412.png)
+## Supervised Fine-tuning
+1. define a classifier that takes the concatenated embeddings from MPNN + OrderCNN as input and predicts the similarity score between two functions.
+```python
+class SimilarityClassifier(nn.Module):
+    def __init__(self, semantic_model, graph_hidden_dim=64):
+        super().__init__()
+        self.semantic_model = semantic_model
+        self.classifier = nn.Sequential(
+            nn.Linear(2 * graph_hidden_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, a_ids, a_adj, t_ids, t_adj):
+        """
+        a_ids: Input IDs for anchor nodes [batch_size, num_nodes, seq_len]
+        a_adj: Adjacency matrix for anchor nodes [batch_size, num_nodes, num_nodes]
+        t_ids: Input IDs for target nodes [batch_size, num_nodes, seq_len]
+        t_adj: Adjacency matrix for target nodes [batch_size, num_nodes, num_nodes]
+        Output:
+            Similarity score [batch_size] 0~1
+        """
+        # Get graph embeddings
+        a_embed = self.semantic_model(a_ids, a_adj)
+        t_embed = self.semantic_model(t_ids, t_adj)
+        
+        # Concatenate embeddings and classify
+        combined = torch.cat([a_embed, t_embed], dim=1)
+        return self.classifier(combined).squeeze()
+```
+## Semantic-aware Modeling
+Use pretrained BERT2 to extract semantic-aware representations of assembly instructions.
+## Structural-aware Modeling
+After obtaining the block embeddings from BERT pretraining, we use MPNN to compute the graph semantic & structural embedding of each CFG.
+```python
+class MPNN(nn.Module):
+    def __init__(self, in_dim=128, hidden_dim=128, n_steps=5):
+        super().__init__()
+        self.n_steps = n_steps
+        self.mpnn_layer = MPNNLayer(in_dim, hidden_dim)
+        self.readout = nn.Sequential(
+            nn.Linear(in_dim * 2, hidden_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, h0, adj):
+        """
+        Inputs:
+            h0: initial node features [batch_size, num_nodes, in_dim]
+            adj: adjacency matrix [batch_size, num_nodes, num_nodes]
+        Output: 
+            graph embedding [batch_size, hidden_dim]
+        """
+        h = h0
+        # Run T steps of message passing
+        for _ in range(self.n_steps):
+            h = self.mpnn_layer(h, adj)
+        
+        # Read out features at step 0 and step T and concatenate
+        h0_sum = torch.sum(h0, dim=1)  # [batch_size, in_dim]
+        hT_sum = torch.sum(h, dim=1)   # [batch_size, in_dim]
+        combined = torch.cat([h0_sum, hT_sum], dim=1)
+        
+        # Generate graph embedding
+        return self.readout(combined)
+
+```
+
+## Order-aware Modeling
+Resnet: 11-layer Resnet with 3 residual blocks. \
+do not use any pooling methods unless on the last layer, because the inputs have different sizes.
+$$ g_o = Maxpooling(Resnet(A))$$
+```python
+class OrderCNN(nn.Module):
+    def __init__(self, in_channels=1, num_blocks=3, out_features=32):
+        super().__init__()
+        # Initial convolutional layer
+        self.conv_in = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
+        self.bn_in = nn.BatchNorm2d(32)
+        
+        # Residual blocks
+        self.res_blocks = nn.Sequential()
+        for i in range(num_blocks):
+            self.res_blocks.add_module(f"res_block_{i}", ResNetBlock(32))
+        
+        # Global max pooling
+        self.pool = nn.AdaptiveMaxPool2d((1, 1))
+        
+        # Output layer
+        self.fc_out = nn.Linear(32, out_features)
+
+    def forward(self, adj):
+        """
+        Input: 
+            adj: adjacency matrix [batch_size, num_nodes, num_nodes]
+        Output: 
+            order embedding [batch_size, out_features]
+        """
+        # Add channel dimension [batch_size, 1, num_nodes, num_nodes]
+        x = adj.unsqueeze(1)
+        
+        # Initial convolution
+        x = F.relu(self.bn_in(self.conv_in(x)))
+        
+        # Residual blocks
+        x = self.res_blocks(x)
+        
+        # Global pooling [batch_size, 32, 1, 1]
+        x = self.pool(x)
+        
+        # Flatten [batch_size, 32]
+        x = x.view(x.size(0), -1)
+        
+        # Output layer [batch_size, out_features]
+        return self.fc_out(x)
+```
+### Results
+
+
+## Problems
+adjacency matrix is too sparse, the input of model requires dense matrix, directly using converted adjacency matrix will lead to huge gpu memory usage.
+### Solutions
++ Implement a model which can handle sparse adjacency matrix, not solved yet.
++ select specific nodes from adjacency matrix, such as the nodes with top-k highest degree (chosen).
++ Use spectural clustering to merge nodes into super nodes, the connectivity will become 0~1. 谱聚类可能会改变图的拓扑结构，例如将多个节点合并成一个超节点，从而破坏了原始的节点顺序（而节点顺序是论文强调的重要信息）。因此，使用谱聚类可能会损害模型性能。
++ 删除孤立节点，压缩邻接矩阵，减少计算量。孤立节点在图中没有连接关系，删除后可以减少计算复杂度，但可能会丢失一些信息。
+
+
+# TODO
+1. 在数据集预处理阶段就删除孤立节点，压缩邻接矩阵，减少计算量。
+2. 实现一个可以处理稀疏邻接矩阵的模型。
+3. 实现BERT4里面的 block inside graph task (BIG) and graph classification task (GC)
+   - BIG task tries to make the model judge whether two nodes exist on the same graph.
+   - GC makes the model to classify blocks in different platforms, different architectures, or different optimization options.
