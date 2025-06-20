@@ -93,3 +93,28 @@ class CombinedCollateFn:
             return self.anp_collate(batches)
         else:
             raise ValueError(f"Unknown task type: {task_type}")
+
+def sparse_collate_fn(batch):
+    a_ids_list, a_idx_list, a_val_list = [], [], []
+    t_ids_list, t_idx_list, t_val_list = [], [], []
+    labels_list = []
+    
+    for item in batch:
+        a_ids, a_idx, a_val, t_ids, t_idx, t_val, label = item
+        a_ids_list.append(a_ids)
+        a_idx_list.append(a_idx)
+        a_val_list.append(a_val)
+        t_ids_list.append(t_ids)
+        t_idx_list.append(t_idx)
+        t_val_list.append(t_val)
+        labels_list.append(label)
+    
+    return (
+        torch.stack(a_ids_list),
+        a_idx_list,  # index list
+        a_val_list,  # value list
+        torch.stack(t_ids_list),
+        t_idx_list,  # index list
+        t_val_list,  # value list
+        torch.stack(labels_list)
+    )

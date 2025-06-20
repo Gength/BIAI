@@ -58,6 +58,85 @@ class MPNN(nn.Module):
         # Generate graph embedding
         return self.readout(combined)
 
+class SparseMPNNLayer(nn.Module):
+    def __init__(self, in_dim, hidden_dim):
+        super().__init__()
+        self.message_func = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU()
+        )
+        self.update_func = nn.GRUCell(hidden_dim, in_dim)
+
+    def forward(self, h, adj_indices_list, adj_values_list, adj_size):
+        """
+        Inputs:
+            h: node features [batch_size, num_nodes, in_dim]
+            adj_indices_list: adjacency matrix indices list [batch_size, [2, num_edges]]
+            adj_values_list: adjacency matrix values list [batch_size, [num_edges]]
+            adj_size: adjacency matrix size [num_nodes, num_nodes]
+        Output: 
+            updated node features [batch_size, num_nodes, in_dim]
+        """
+        batch_size, num_nodes, _ = h.shape
+        
+        # Create batch sparse tensor
+        batch_indices = []
+        batch_values = []
+        for i in range(batch_size):
+            # Get indices and values for current graph
+            graph_indices = adj_indices_list[i]
+            graph_values = adj_values_list[i]
+            
+            # Add batch dimension to indices
+            offset = i * num_nodes
+            indices = graph_indices.clone()
+            indices[0] += offset
+            indices[1] += offset
+            batch_indices.append(indices)
+            batch_values.append(graph_values)
+        
+        # Merge all indices and values
+        batch_indices = torch.cat(batch_indices, dim=1)
+        batch_values = torch.cat(batch_values)
+        
+        # Create batch sparse adjacency matrix
+        sparse_adj = torch.sparse_coo_tensor(
+            batch_indices, 
+            batch_values,
+            size=(batch_size * num_nodes, batch_size * num_nodes)
+        )
+        
+        # Message passing: m = A * MLP(h)
+        mlp_h = self.message_func(h.view(-1, h.size(-1)))  # [batch*num_nodes, hidden]
+        m = torch.sparse.mm(sparse_adj, mlp_h)  # [batch*num_nodes, hidden]
+        m = m.view(batch_size, num_nodes, -1)    # [batch, num_nodes, hidden]
+        
+        # Update node features
+        h_flat = h.view(-1, h.size(-1))  # [batch*num_nodes, in_dim]
+        m_flat = m.view(-1, m.size(-1))  # [batch*num_nodes, hidden]
+        updated_flat = self.update_func(m_flat, h_flat)
+        return updated_flat.view(batch_size, num_nodes, -1)
+
+class SparseMPNN(nn.Module):
+    def __init__(self, in_dim, hidden_dim, n_steps=5):
+        super().__init__()
+        self.n_steps = n_steps
+        self.mpnn_layer = SparseMPNNLayer(in_dim, hidden_dim)
+        self.readout = nn.Sequential(
+            nn.Linear(in_dim * 2, hidden_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, h0, adj_indices, adj_values, adj_size):
+        h = h0
+        for _ in range(self.n_steps):
+            h = self.mpnn_layer(h, adj_indices, adj_values, adj_size)
+        
+        h0_sum = torch.sum(h0, dim=1)  # [batch_size, in_dim]
+        hT_sum = torch.sum(h, dim=1)   # [batch_size, in_dim]
+        combined = torch.cat([h0_sum, hT_sum], dim=1)
+        return self.readout(combined)
+
 class ResNetBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -191,6 +270,66 @@ class CFGFusionModel(nn.Module):
         
         return graph_embedding
 
+class SparseCFGFusionModel(nn.Module):
+    def __init__(self, bert_model, d_model=128, hidden_dim=64, device="cuda"):
+        super().__init__()
+        self.device = device
+        self.bert = bert_model
+        self.mpnn = SparseMPNN(in_dim=d_model, hidden_dim=d_model, n_steps=5)
+        self.order_cnn = OrderCNN(in_channels=1, num_blocks=3)
+        self.fusion = nn.Sequential(
+            nn.Linear(d_model + 32, hidden_dim),
+            nn.ReLU()
+        )
+    
+    def forward(self, input_ids, adj_indices_list, adj_values_list):
+        """
+        Inputs:
+            input_ids: token sequences [batch_size, num_nodes, seq_len]
+            adj_indices_list: adjacency matrix indices list [batch_size, [2, num_edges]]
+            adj_values_list: adjacency matrix values list [batch_size, [num_edges]]
+        """
+        batch_size, num_nodes, seq_len = input_ids.shape
+        
+        # Semantic modeling
+        flat_input_ids = input_ids.view(batch_size * num_nodes, seq_len)
+        block_embeddings = self.bert.encode(flat_input_ids)
+        node_features = block_embeddings.view(batch_size, num_nodes, -1)
+        
+        # Structure modeling (using sparse matrix)
+        structure_embedding = self.mpnn(
+            node_features, 
+            adj_indices_list, 
+            adj_values_list, 
+            (num_nodes, num_nodes)
+        )
+        
+        # Order modeling (requires dense matrix)
+        order_embeddings = []
+        for i in range(batch_size):
+            if len(adj_indices_list[i]) > 0:  # If there are edges
+                adj_dense = torch.sparse_coo_tensor(
+                    adj_indices_list[i], 
+                    adj_values_list[i], 
+                    size=(num_nodes, num_nodes)
+                ).to_dense()
+            else:
+                adj_dense = torch.zeros(num_nodes, num_nodes, device=self.device)
+            
+            # Add batch dimension [1, num_nodes, num_nodes]
+            adj_dense = adj_dense.unsqueeze(0)
+            order_emb = self.order_cnn(adj_dense)
+            order_embeddings.append(order_emb)
+        
+        # Stack batch results
+        order_embedding = torch.cat(order_embeddings, dim=0)
+        
+        # Fusion
+        combined = torch.cat([structure_embedding, order_embedding], dim=-1)
+        graph_embedding = self.fusion(combined)
+        
+        return graph_embedding
+
 class SimilarityClassifier(nn.Module):
     def __init__(self, semantic_model, graph_hidden_dim=64):
         super().__init__()
@@ -220,6 +359,19 @@ class SimilarityClassifier(nn.Module):
         # Get graph embeddings
         a_embed = self.semantic_model(a_ids, a_adj)
         t_embed = self.semantic_model(t_ids, t_adj)
+        
+        # Concatenate embeddings and classify
+        combined = torch.cat([a_embed, t_embed], dim=1)
+        return self.classifier(combined).squeeze()
+
+class SparseSimilarityClassifier(SimilarityClassifier):
+   def forward(self, a_ids, a_adj_indices, a_adj_values, t_ids, t_adj_indices, t_adj_values):
+        """
+        Modified forward pass, accepts sparse adjacency matrix parameters
+        """
+        # Get graph embeddings
+        a_embed = self.semantic_model(a_ids, a_adj_indices, a_adj_values)
+        t_embed = self.semantic_model(t_ids, t_adj_indices, t_adj_values)
         
         # Concatenate embeddings and classify
         combined = torch.cat([a_embed, t_embed], dim=1)
