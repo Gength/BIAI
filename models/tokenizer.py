@@ -1,6 +1,5 @@
 import os
 import re
-import string
 
 class AsmTokenizer:
 	def __init__(self, corpus=None, vocab_file=None, max_vocab_size=5000):

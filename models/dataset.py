@@ -388,7 +388,7 @@ class FunctionPairDataset(Dataset):
 			warnings.filterwarnings("ignore", category=ConvergenceWarning)
 			
 			try:
-				# Use looser convergence criteria
+				# For large graphs, use faster method
 				if n_nodes > 500:
 					clustering = SpectralClustering(
 						n_clusters=n_clusters,

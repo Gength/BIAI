@@ -17,11 +17,11 @@ class Config:
     seq_len = 128    # Maximum sequence length
     hidden_dim = 64  # Graph embedding dimension
     lr = 1e-4
-    epochs = 8
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    bert_checkpoint = os.path.join(".", "outputs", "bert-pretrain-epoch-8", "bert2"
+    epochs = 9
+    device = "cuda"
+    bert_checkpoint = os.path.join("outputs", "bert-pretrain-epoch-8", "bert2"
     "-best.pth")  # Pretrained BERT path
-    checkpoint_save_path = os.path.join(".", "outputs", "bert-finetune-epoch")  # Checkpoint save path
+    checkpoint_save_path = os.path.join("outputs", "bert-finetune")  # Checkpoint save path
     use_amp = True  # Use Automatic Mixed Precision (AMP) if available
     wandb_run = "bert2-finetune"  # Weights & Biases run name
     wandb_project = "bert2-training"  # Weights & Biases project name
@@ -57,12 +57,14 @@ class BERT2FinetuneTrainer:
         self.criterion = nn.BCEWithLogitsLoss()
         
         # Learning rate scheduler
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        total_steps = len(train_loader) * num_epochs
+        self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=3,
-            min_lr=1e-6
+            max_lr=1e-3,
+            total_steps=total_steps,
+            pct_start=0.1,
+            anneal_strategy="cos",
+            final_div_factor=1e2,
         )
         
         # Mixed precision training
@@ -98,18 +100,13 @@ class BERT2FinetuneTrainer:
             # Validation phase
             val_loss, val_acc = self.validate_epoch(epoch)
             
-            # Update learning rate
-            self.scheduler.step(val_loss)
-            current_lr = self.scheduler.get_last_lr()[0]
-            print(f"Current learning rate: {current_lr:.8f}")
-            
             # Log epoch metrics to wandb
             wandb.log({
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "val_accuracy": val_acc,
-                "learning_rate": current_lr
+                # "learning_rate": current_lr
             })
             
             # Save best model
@@ -120,7 +117,7 @@ class BERT2FinetuneTrainer:
                 print(f"Saved new best model with accuracy {val_acc:.4f}")
             
             # Save checkpoint
-            checkpoint_save_path = os.path.join(self.checkpoint_save_path, f"CFGFusion-epoch-{epoch}.pth")
+            checkpoint_save_path = os.path.join(self.model_save_path, f"CFGFusion-epoch-{epoch}.pth")
             torch.save(self.model.state_dict(), checkpoint_save_path)
         
         print("Training completed!")
@@ -160,7 +157,10 @@ class BERT2FinetuneTrainer:
             progress.set_postfix(loss=loss.item())
             
             if i % self.log_freq == 0:
-                wandb.log({"batch_train_loss": loss.item()})
+                wandb.log({"batch_train_loss": loss.item(),
+                           "lr": self.optim_schedule.get_last_lr()[0]
+                           })
+            self.optim_schedule.step()
         
         return total_loss / len(self.train_loader)
 
@@ -237,18 +237,18 @@ if __name__ == "__main__":
     
     # Create datasets
     train_dataset = FunctionPairDataset(
-        csv_path=os.path.join(".", "outputs", "train-function_pool.csv"),
-        jsonl_path=os.path.join(".", "outputs", "baseline-train.jsonl"),
-        mapping_path=os.path.join(".", "outputs", "train-function-idx-mapping.pkl"),
+        csv_path=os.path.join("outputs", "train-function_pool.csv"),
+        jsonl_path=os.path.join("outputs", "baseline-train.jsonl"),
+        mapping_path=os.path.join("outputs", "train-function-idx-mapping.pkl"),
         tokenizer=tokenizer,
         seq_len=config.seq_len,
         max_blocks=config.max_blocks
     )
     
     val_dataset = FunctionPairDataset(
-        csv_path=os.path.join(".", "outputs", "val-function_pool.csv"),
-        jsonl_path=os.path.join(".", "outputs", "baseline-val.jsonl"),
-        mapping_path=os.path.join(".", "outputs", "val-function-idx-mapping.pkl"),
+        csv_path=os.path.join("outputs", "val-function_pool.csv"),
+        jsonl_path=os.path.join("outputs", "baseline-val.jsonl"),
+        mapping_path=os.path.join("outputs", "val-function-idx-mapping.pkl"),
         tokenizer=tokenizer,
         seq_len=config.seq_len,
         max_blocks=config.max_blocks

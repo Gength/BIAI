@@ -10,10 +10,9 @@ from datasets import load_dataset
 from models.dataset import TaskDataset
 from models.collatefn import MLMCollateFn, ANPCollateFn, CombinedCollateFn
 import wandb
-import time
 class Config:
-    batch_size = 30  # RTX 4080: 10, A40: 30
-    epochs = 8
+    batch_size = 40  # RTX 4080: 10, A40: 40
+    epochs = 9
     seq_len = 128    # Maximum sequence length
     lr = 1e-4
     epochs = 8
@@ -31,7 +30,7 @@ class BERT2PretrainTrainer:
         anp_train_loader,
         mlm_valid_loader,
         anp_valid_loader,
-        lr=1e-4,
+        lr=1e-5,
         weight_decay=0.01,
         betas=(0.9, 0.999),
         log_freq=10,
@@ -59,7 +58,7 @@ class BERT2PretrainTrainer:
         self.optim_schedule = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optim,
             T_max=total_steps,
-            eta_min=1e-6  # 最低学习率
+            eta_min=1e-6  # minimum learning rate
         )
         # self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
         #     self.optim,
@@ -88,19 +87,9 @@ class BERT2PretrainTrainer:
             "device": device
         })
         wandb.watch(self.model, log=None)
-
-        # if os.path.exists(os.path.join(".", "outputs", "epoch")):
-        #     file_list = os.listdir(os.path.join(".", "outputs", "epoch"))
-        #     for file_name in file_list:
-        #         if os.path.isfile(os.path.join(".", "outputs", "epoch", file_name)):
-        #             os.remove(os.path.join(".", "outputs", "epoch", file_name))  # Clear previous epoch files
-        # else:
-        #     os.makedirs(os.path.join(".", "outputs", "epoch"), exist_ok=True)  # Ensure output directory exists
         os.makedirs(self.model_save_path, exist_ok=True)
 
     def train(self):
-        with open(os.path.join(".", "outputs", "bert-pretrain-epoch", "best-model-log.txt"), "w") as f:
-            f.write(f"Start time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         for epoch in range(self.num_epochs):
             # Training phase
             train_loss = self.train_epoch(epoch)
@@ -271,20 +260,19 @@ class dummy_context:
         pass
 
 if __name__ == "__main__":
-    data_dir = "."
 
     tokenizer = AsmTokenizer(
-        vocab_file=os.path.join(data_dir, "outputs", f"baseline-vocab.txt")
+        vocab_file=os.path.join("outputs", f"baseline-vocab.txt")
     )
     print(f"Vocab size: {len(tokenizer.vocab)}")
     # Set cache directory
-    cache_dir = os.path.join(data_dir, "outputs", "cache")
+    cache_dir = os.path.join("outputs", "cache")
     os.makedirs(cache_dir, exist_ok=True)
 
     # Load training set (enable memory mapping)
     train_dataset = load_dataset(
         "json",
-        data_files=os.path.join(data_dir, "outputs", f"baseline-train.jsonl"),
+        data_files=os.path.join("outputs", f"baseline-train.jsonl"),
         split="train",
         cache_dir=cache_dir,
         keep_in_memory=False  # Use memory mapping to save memory
@@ -294,7 +282,7 @@ if __name__ == "__main__":
     # Load validation set (enable memory mapping)
     valid_dataset = load_dataset(
         "json",
-        data_files=os.path.join(data_dir, "outputs", f"baseline-val.jsonl"),
+        data_files=os.path.join("outputs", f"baseline-val.jsonl"),
         split="train",
         cache_dir=cache_dir,
         keep_in_memory=False  # Use memory mapping to save memory
@@ -339,7 +327,7 @@ if __name__ == "__main__":
         device=config.device
     )
     # Load pretrained weights
-    bert_model.load_state_dict(torch.load(os.path.join(data_dir, "outputs", "bert-pretrain-epoch-8", "bert2-best.pth")))
+    bert_model.load_state_dict(torch.load(os.path.join("outputs", "bert-pretrain-epoch-8", "bert2-best.pth")))
     # convert model to float32
     bert_model = bert_model.float()
 

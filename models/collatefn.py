@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import random
-from models.dataset import BERTMLMDataset, BERTANPDataset, TaskDataset
+from models.dataset import BERTMLMDataset, BERTANPDataset
 class MLMCollateFn:
     def __init__(self, tokenizer, seq_len=128, train=True, samples_per_batch=10):
         self.tokenizer = tokenizer
