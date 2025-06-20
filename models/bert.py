@@ -305,9 +305,9 @@ class BERT(nn.Module):
         Output: 
             (loss, logits) where logits [batch_size, seq_len, vocab_size]
         """
-        logits = self.bert(input_ids)
-        loss = F.nll_loss(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=0)
-        return loss, logits
+        log_probs = self.bert(input_ids)
+        loss = F.nll_loss(log_probs.view(-1, log_probs.size(-1)), labels.view(-1), ignore_index=0)
+        return loss, log_probs
 
     def encode(self, input_ids):
         """

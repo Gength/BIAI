@@ -35,6 +35,8 @@ class BERT2FinetuneTrainer:
         train_loader,
         val_loader,
         lr=1e-4,
+        weight_decay=0.01,
+        betas=(0.9, 0.999),
         log_freq=10,
         num_epochs=10,
         model_save_path="",
@@ -53,7 +55,9 @@ class BERT2FinetuneTrainer:
         self.best_val_loss = float('inf')
         
         # Optimizer and loss function
-        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.optimizer = optim.Adam(
+            self.model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay
+        )
         self.criterion = nn.BCEWithLogitsLoss()
         
         # Learning rate scheduler
@@ -102,7 +106,7 @@ class BERT2FinetuneTrainer:
             
             # Log epoch metrics to wandb
             wandb.log({
-                "epoch": epoch,
+                "epoch": epoch + 1,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "val_accuracy": val_acc,
@@ -157,8 +161,10 @@ class BERT2FinetuneTrainer:
             progress.set_postfix(loss=loss.item())
             
             if i % self.log_freq == 0:
-                wandb.log({"batch_train_loss": loss.item(),
-                           "lr": self.optim_schedule.get_last_lr()[0]
+                wandb.log({
+                    "batch": epoch * len(self.train_loader) + i,
+                    "batch_train_loss": loss.item(),
+                    "lr": self.optim_schedule.get_last_lr()[0]
                            })
             self.optim_schedule.step()
         
@@ -198,6 +204,7 @@ class BERT2FinetuneTrainer:
                 
                 if i % self.log_freq == 0:
                     wandb.log({
+                        "batch": epoch * len(self.val_loader) + i,
                         "batch_val_loss": loss.item(),
                         "batch_val_accuracy": accuracy
                     })

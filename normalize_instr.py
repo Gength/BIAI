@@ -213,12 +213,13 @@ def disassemble_function(binary_path, function_address=None, function_name=None)
 
     # sort the basic blocks by their address
     blocks = sorted(target_func.blocks, key=lambda b: b.addr)
-    
+    normalized_blocks = []
     for block in blocks:
         print(f"\n; basic block 0x{block.addr:x} - 0x{block.addr + block.size:x}")
         
         # disassemble each instruction in the block
         capstone = project.arch.capstone
+        normalized_instrs = []
         for instruction in capstone.disasm(block.bytes, block.addr):
             # original instruction 
             address = f"0x{instruction.address:x}"
@@ -231,8 +232,11 @@ def disassemble_function(binary_path, function_address=None, function_name=None)
                 instruction, 
                 project.arch.bits
             )
-            
             print(f"{address}: {raw_inst.ljust(30)} => {normalized}")
+            normalized_instrs.append((address, raw_inst, normalized))
+        normalized_blocks.append(normalized_instrs)
+            
+    return normalized_blocks
 
 def process_binary_file(args):
     Unknown = {

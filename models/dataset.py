@@ -118,20 +118,20 @@ class TaskDataset(Dataset):
 
 # Custom dataset class
 class FunctionPairDataset(Dataset):
-	def __init__(self, csv_path, jsonl_path, mapping_path, tokenizer:AsmTokenizer, seq_len=128, max_blocks=50):
+	def __init__(self, csv_path, jsonl_path, mapping_path, tokenizer:AsmTokenizer, seq_len=128, max_nodes=300):
 		self.df = pd.read_csv(csv_path)
 		self.dataset = load_dataset(
 			"json", 
 			data_files=jsonl_path,
 			split="train",
-			cache_dir= os.path.join(".", "outputs", "cache"),
+			cache_dir=os.path.join(".", "outputs", "cache"),
 			keep_in_memory=False
 		)
 		with open(mapping_path, "rb") as f:
 			self.mapping = pickle.load(f)
 		self.tokenizer = tokenizer
 		self.seq_len = seq_len
-		self.max_blocks = max_blocks
+		self.max_nodes = max_nodes
 
 	def __len__(self):
 		return len(self.df)
@@ -158,44 +158,27 @@ class FunctionPairDataset(Dataset):
 		return a_input_ids, a_adj, t_input_ids, t_adj, label
 
 	def process_function(self, func_data):
-		"""
-		Process a single function for model input
-		Args:
-			func_data: Dictionary containing function data
-		Returns:
-			input_ids: Tokenized instruction blocks (tensor)
-			adj: Processed adjacency matrix (tensor)
-		"""
 		instr_blocks = func_data["instruction_blocks"]
 		adj_data = func_data["adjacency_matrix"]
 		n_blocks = adj_data["shape"][0]
 		
 		# Create sparse adjacency matrix
-		original_adj = coo_matrix(
+		adj = coo_matrix(
 			(adj_data["data"], (adj_data["row"], adj_data["col"])),
 			shape=adj_data["shape"]
 		)
 		
-		# Handle different graph sizes
-		if n_blocks <= self.max_blocks:
-			return self._process_small_graph(instr_blocks, original_adj)
-		elif n_blocks <= 1000:  # Medium-sized graph
-			return self._coarsen_with_clustering(instr_blocks, original_adj)
-		else:  # Very large graph
-			return self._process_huge_graph(instr_blocks, original_adj)
+		# === Skip clustering, process the original graph directly ===
+		return self._process_with_padding(instr_blocks, adj, n_blocks)
 
-	def _process_small_graph(self, instr_blocks, adj_matrix):
-		"""
-		Process graphs smaller than max_blocks with padding
-		Args:
-			instr_blocks: List of instruction strings
-			adj_matrix: Sparse adjacency matrix (coo_matrix)
-		Returns:
-			input_ids: Tokenized blocks with padding
-			adj: Padded adjacency matrix
-		"""
+	def _process_with_padding(self, instr_blocks, adj_matrix, actual_nodes):
+		"""Directly pad and process, keeping the original graph structure"""
 		processed_blocks = []
-		for block in instr_blocks:
+		
+		# 1. Process instruction blocks
+		for i, block in enumerate(instr_blocks):
+			if i >= self.max_nodes:  # Truncate if exceeding max_nodes
+				break
 			processed_block = tokenize_and_pad(
 				text=block,
 				tokenizer=self.tokenizer,
@@ -203,237 +186,24 @@ class FunctionPairDataset(Dataset):
 			)
 			processed_blocks.append(torch.tensor(processed_block))
 		
-		# Pad blocks if needed
-		if len(processed_blocks) < self.max_blocks:
-			for _ in range(self.max_blocks - len(processed_blocks)):
+		# Pad blocks if not enough
+		if len(processed_blocks) < self.max_nodes:
+			for _ in range(self.max_nodes - len(processed_blocks)):
 				processed_blocks.append(
 					torch.tensor([self.tokenizer.pad_token_id] * self.seq_len)
 				)
 		
 		input_ids = torch.stack(processed_blocks, dim=0)
 		
-		# Convert to dense array for padding
+		# 2. Process adjacency matrix
 		adj_array = adj_matrix.toarray()
-		if adj_array.shape[0] < self.max_blocks:
-			padded_adj = np.zeros((self.max_blocks, self.max_blocks))
-			padded_adj[:adj_array.shape[0], :adj_array.shape[1]] = adj_array
+		if actual_nodes > self.max_nodes:
+			# Truncate if exceeding max_nodes
+			adj_array = adj_array[:self.max_nodes, :self.max_nodes]
+		elif actual_nodes < self.max_nodes:
+			# Pad if not enough
+			padded_adj = np.zeros((self.max_nodes, self.max_nodes))
+			padded_adj[:actual_nodes, :actual_nodes] = adj_array
 			adj_array = padded_adj
 		
 		return input_ids, torch.tensor(adj_array, dtype=torch.float32)
-
-	def _coarsen_with_clustering(self, instr_blocks, adj_matrix):
-		"""
-		Coarsen medium-sized graphs using spectral clustering
-		Args:
-			instr_blocks: List of instruction strings
-			adj_matrix: Sparse adjacency matrix (coo_matrix)
-		Returns:
-			input_ids: Tokenized coarsened blocks
-			adj: Coarsened adjacency matrix
-		"""
-		# Convert to dense array for clustering
-		adj_array = adj_matrix.toarray()
-		n_blocks = adj_array.shape[0]
-		
-		if adj_array.dtype != np.float32 and adj_array.dtype != np.float64:
-			adj_array = adj_array.astype(np.float32)
-
-		# Create symmetric version for clustering
-		symmetric_adj = adj_array + adj_array.T
-		
-		# Apply spectral clustering
-		cluster_labels = self._spectral_clustering(symmetric_adj, self.max_blocks)
-		
-		# Create new adjacency matrix between supernodes
-		new_adj = np.zeros((self.max_blocks, self.max_blocks), dtype=np.float32)
-		for i in range(n_blocks):
-			for j in range(n_blocks):
-				if adj_array[i, j] > 0:  # Consider existing edges
-					cluster_i = cluster_labels[i]
-					cluster_j = cluster_labels[j]
-					new_adj[cluster_i, cluster_j] += adj_array[i, j]
-		
-		# Normalize by cluster size to preserve density
-		cluster_sizes = np.bincount(cluster_labels, minlength=self.max_blocks)
-		with np.errstate(divide='ignore', invalid='ignore'):
-			normalization = np.outer(cluster_sizes, cluster_sizes)
-			new_adj = np.divide(new_adj, normalization, where=normalization>0)
-		
-		# Merge instruction blocks within clusters
-		merged_blocks = []
-		for cluster_id in range(self.max_blocks):
-			block_indices = np.where(cluster_labels == cluster_id)[0]
-			cluster_text = " <SEP> ".join(instr_blocks[i] for i in block_indices)
-			tokenized = tokenize_and_pad(
-				text=cluster_text,
-				tokenizer=self.tokenizer,
-				seq_len=self.seq_len
-			)
-			merged_blocks.append(torch.tensor(tokenized))
-		
-		input_ids = torch.stack(merged_blocks, dim=0)
-		return input_ids, torch.tensor(new_adj, dtype=torch.float32)
-
-	def _process_huge_graph(self, instr_blocks, adj_matrix):
-		"""
-		Process very large graphs (>1000 nodes) with truncation followed by clustering
-		Args:
-			instr_blocks: List of instruction strings
-			adj_matrix: Sparse adjacency matrix (coo_matrix)
-		Returns:
-			input_ids: Tokenized blocks
-			adj: Processed adjacency matrix
-		"""
-		# Determine truncation size (2x max_blocks but at least 100)
-		trunc_size = max(2 * self.max_blocks, 100)
-		n_blocks = adj_matrix.shape[0]
-		
-		# Step 1: Truncate graph to manageable size
-		trunc_blocks = min(trunc_size, n_blocks)
-		trunc_instr = instr_blocks[:trunc_blocks]
-		
-		# Fix: Correctly extract the subset of the COO matrix
-		# Get the row and column indices to keep
-		rows = adj_matrix.row
-		cols = adj_matrix.col
-		data = adj_matrix.data
-		
-		# Find edges among the first trunc_blocks nodes
-		mask = (rows < trunc_blocks) & (cols < trunc_blocks)
-		trunc_rows = rows[mask]
-		trunc_cols = cols[mask]
-		trunc_data = data[mask]
-		
-		# Create the truncated adjacency matrix
-		trunc_adj = coo_matrix(
-			(trunc_data, (trunc_rows, trunc_cols)),
-			shape=(trunc_blocks, trunc_blocks),
-		)
-		trunc_adj_dense = trunc_adj.toarray()
-		
-		# Ensure float type
-		if trunc_adj_dense.dtype != np.float32 and trunc_adj_dense.dtype != np.float64:
-			trunc_adj_dense = trunc_adj_dense.astype(np.float32)
-		
-		# Step 2: Apply clustering on truncated graph
-		symmetric_adj = trunc_adj_dense + trunc_adj_dense.T
-		cluster_labels = self._spectral_clustering(symmetric_adj, self.max_blocks)
-		
-		# Create new adjacency matrix
-		new_adj = np.zeros((self.max_blocks, self.max_blocks), dtype=np.float32)
-		for i in range(trunc_blocks):
-			for j in range(trunc_blocks):
-				if trunc_adj_dense[i, j] > 0:
-					cluster_i = cluster_labels[i]
-					cluster_j = cluster_labels[j]
-					new_adj[cluster_i, cluster_j] += trunc_adj_dense[i, j]
-		
-		# Normalize by cluster size
-		cluster_sizes = np.bincount(cluster_labels, minlength=self.max_blocks)
-		with np.errstate(divide='ignore', invalid='ignore'):
-			normalization = np.outer(cluster_sizes, cluster_sizes)
-			new_adj = np.divide(new_adj, normalization, where=normalization>0)
-		
-		# Merge instruction blocks within clusters
-		merged_blocks = []
-		for cluster_id in range(self.max_blocks):
-			block_indices = np.where(cluster_labels == cluster_id)[0]
-			cluster_text = " <SEP> ".join(trunc_instr[i] for i in block_indices)
-			tokenized = tokenize_and_pad(
-				text=cluster_text,
-				tokenizer=self.tokenizer,
-				seq_len=self.seq_len
-			)
-			merged_blocks.append(torch.tensor(tokenized))
-		
-		input_ids = torch.stack(merged_blocks, dim=0)
-		return input_ids, torch.tensor(new_adj, dtype=torch.float32)
-
-	def _spectral_clustering(self, adj_matrix, n_clusters):
-		"""
-		Perform spectral clustering on adjacency matrix
-		Args:
-			adj_matrix: Dense symmetric adjacency matrix
-			n_clusters: Number of clusters to create
-		Returns:
-			Cluster labels for each node
-		"""
-		# Ensure labels are in the range [0, n_clusters-1]
-		def normalize_labels(labels, n_clusters):
-			unique = np.unique(labels)
-			if len(unique) > n_clusters or np.max(labels) >= n_clusters:
-				# Remap labels to the range 0~n_clusters-1
-				_, labels = np.unique(labels, return_inverse=True)
-				labels = labels % n_clusters  # Ensure no overflow
-			return labels
-
-		# Handle small matrices
-		n_nodes = adj_matrix.shape[0]
-		if n_nodes <= n_clusters:
-			labels = np.arange(n_nodes)
-			return normalize_labels(labels, n_clusters)
-		
-		# Ensure matrix is float type
-		if adj_matrix.dtype != np.float32 and adj_matrix.dtype != np.float64:
-			adj_matrix = adj_matrix.astype(np.float32)
-		
-		# Add stronger regularization to improve convergence
-		regularization = 1e-4 * np.eye(adj_matrix.shape[0])
-		adj_matrix += regularization
-		
-		# Apply spectral clustering
-		with warnings.catch_warnings():
-			warnings.filterwarnings("ignore", 
-				message="Graph is not fully connected, spectral embedding may not work as expected.")
-			warnings.filterwarnings("ignore", category=ConvergenceWarning)
-			
-			try:
-				# For large graphs, use faster method
-				if n_nodes > 500:
-					clustering = SpectralClustering(
-						n_clusters=n_clusters,
-						affinity='precomputed',
-						assign_labels='kmeans',
-						random_state=42,
-						n_init=10,
-						eigen_tol=1e-3  # Lower precision requirement
-					)
-				else:
-					clustering = SpectralClustering(
-						n_clusters=n_clusters,
-						affinity='precomputed',
-						assign_labels='discretize',
-						random_state=42,
-						eigen_tol=1e-3  # Lower precision requirement
-					)
-				
-				labels = clustering.fit_predict(adj_matrix)
-				return normalize_labels(labels, n_clusters)
-			
-			except Exception as e:
-				print(f"Spectral clustering failed: {e}, using fallback method")
-				
-				# Fallback 1: Connected components
-				try:
-					from scipy.sparse.csgraph import connected_components
-					_, labels = connected_components(
-						csgraph=adj_matrix, 
-						directed=False, 
-						return_labels=True
-					)
-					unique_labels = np.unique(labels)
-					if len(unique_labels) < n_clusters:
-						from sklearn.cluster import KMeans
-						degrees = np.sum(adj_matrix, axis=1)
-						kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-						labels = kmeans.fit_predict(degrees.reshape(-1, 1))
-					return normalize_labels(labels, n_clusters)
-				
-				# Fallback 2: Degree-based clustering
-				except:
-					degrees = np.sum(adj_matrix, axis=1)
-					sorted_indices = np.argsort(degrees)[::-1]
-					labels = np.zeros(n_nodes, dtype=int)
-					for i in range(n_nodes):
-						labels[sorted_indices[i]] = i % n_clusters
-					return normalize_labels(labels, n_clusters)
