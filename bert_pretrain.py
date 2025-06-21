@@ -19,6 +19,7 @@ class Config:
     device = "cuda"
     checkpoint_save_path = os.path.join("outputs", "bert-pretrain")
     use_amp = True  # Use Automatic Mixed Precision (AMP) if available
+    use_wandb = True  # Use Weights & Biases for logging
     wandb_run = "bert2-pretrain"  # Weights & Biases run name
     wandb_project = "bert2-training"  # Weights & Biases project name
 config = Config()
@@ -55,19 +56,19 @@ class BERT2PretrainTrainer:
         total_steps = max(len(mlm_train_loader), len(anp_train_loader)) * num_epochs
         
         # Single learning rate scheduler
-        self.optim_schedule = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optim,
-            T_max=total_steps,
-            eta_min=1e-6  # minimum learning rate
-        )
-        # self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
+        # self.optim_schedule = torch.optim.lr_scheduler.CosineAnnealingLR(
         #     self.optim,
-        #     max_lr=1e-4,
-        #     total_steps=total_steps,
-        #     pct_start=0.1,
-        #     anneal_strategy="cos",
-        #     final_div_factor=1e2,
+        #     T_max=total_steps,
+        #     eta_min=1e-6  # minimum learning rate
         # )
+        self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
+            self.optim,
+            max_lr=1e-3,
+            total_steps=total_steps,
+            pct_start=0.1,
+            anneal_strategy="cos",
+            final_div_factor=1e2,
+        )
 
         self.log_freq = log_freq
         self.best_loss = float('inf')
@@ -77,7 +78,10 @@ class BERT2PretrainTrainer:
         if use_amp:
             self.scaler = torch.amp.GradScaler('cuda')
         print("Total Parameters:", sum([p.nelement() for p in self.model.parameters()]))
-        
+        if config.use_wandb:
+            os.environ["WANDB_MODE"] = "online"  # Enable Weights & Biases logging
+        else:
+            os.environ["WANDB_MODE"] = "disabled"  # Disable Weights & Biases logging
         # Initialize wandb
         wandb.init(project="bert2-training", config={
             "learning_rate": lr,
@@ -327,9 +331,7 @@ if __name__ == "__main__":
         device=config.device
     )
     # Load pretrained weights
-    bert_model.load_state_dict(torch.load(os.path.join("outputs", "bert-pretrain-epoch-8", "bert2-best.pth")))
-    # convert model to float32
-    bert_model = bert_model.float()
+    # bert_model.load_state_dict(torch.load(os.path.join("outputs", "bert-pretrain-epoch-8", "bert2-best.pth")))
 
     # Create trainers
     trainer = BERT2PretrainTrainer(

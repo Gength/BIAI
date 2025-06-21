@@ -11,6 +11,7 @@ import wandb
 from models.model import CFGFusionModel, SimilarityClassifier
 from models.tokenizer import AsmTokenizer
 from models.dataset import FunctionPairDataset
+import math
 
 # Configuration parameters with sampling ratios
 class Config:
@@ -19,7 +20,7 @@ class Config:
     seq_len = 128    # Maximum sequence length
     hidden_dim = 64  # Graph embedding dimension
     lr = 1e-4
-    epochs = 20
+    epochs = 12
     device = "cuda"
     bert_checkpoint = os.path.join("outputs", "bert-pretrain-epoch-8", "bert2"
     "-best.pth")  # Pretrained BERT path
@@ -70,14 +71,34 @@ class BERT2FinetuneTrainer:
         # Sampling seed
         self.sample_seed = 42
         
+        # Initialize sampling state
+        self.train_sampled_indices = set()
+        self.train_unsampled_indices = set(range(len(train_dataset)))
+        self.val_sampled_indices = set()
+        self.val_unsampled_indices = set(range(len(val_dataset)))
+        
         # Optimizer and loss function
         self.optimizer = optim.Adam(
             self.model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay
         )
         self.criterion = nn.BCEWithLogitsLoss()
         
-        # Learning rate scheduler will be initialized after creating DataLoader
-        self.optim_schedule = None
+        # Calculate total global steps
+        train_samples_per_epoch = int(len(train_dataset) * config.train_sample_ratio)
+        steps_per_epoch = math.ceil(train_samples_per_epoch / config.batch_size)
+        total_steps = steps_per_epoch * num_epochs
+
+        # Initialize global learning rate scheduler
+        self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=1e-3,
+            total_steps=total_steps,
+            pct_start=0.3,
+            anneal_strategy="cos",
+            final_div_factor=1e2,
+            div_factor=25,
+            three_phase=False
+        )
         
         # Mixed precision training
         if use_amp:
@@ -97,7 +118,8 @@ class BERT2FinetuneTrainer:
                 "epochs": num_epochs,
                 "device": device,
                 "train_sample_ratio": config.train_sample_ratio,
-                "val_sample_ratio": config.val_sample_ratio
+                "val_sample_ratio": config.val_sample_ratio,
+                "total_training_steps": total_steps
             }
         )
         wandb.run.name = config.wandb_run
@@ -117,14 +139,14 @@ class BERT2FinetuneTrainer:
             np.random.seed(self.sample_seed)
             random.seed(self.sample_seed)
             
-            # Sample training set
+            # Sample training set (use non-repetitive sampling)
             train_indices = self.sample_dataset_indices(
                 self.train_dataset, 
                 config.train_sample_ratio,
                 "training"
             )
             
-            # Sample validation set
+            # Sample validation set (use non-repetitive sampling)
             val_indices = self.sample_dataset_indices(
                 self.val_dataset, 
                 config.val_sample_ratio,
@@ -139,16 +161,6 @@ class BERT2FinetuneTrainer:
             train_loader = self.create_data_loader(train_subset, shuffle=True)
             val_loader = self.create_data_loader(val_subset, shuffle=False)
             
-            # Initialize learning rate scheduler
-            self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
-                self.optimizer,
-                max_lr=1e-3,
-                total_steps=len(train_loader),  # Different steps per epoch
-                pct_start=0.1,
-                anneal_strategy="cos",
-                final_div_factor=1e2,
-            )
-            
             # Training phase
             train_loss = self.train_epoch(epoch, train_loader)
             
@@ -161,8 +173,6 @@ class BERT2FinetuneTrainer:
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "val_accuracy": val_acc,
-                "train_samples_used": len(train_indices),
-                "val_samples_used": len(val_indices)
             })
             
             # Save best model
@@ -180,13 +190,35 @@ class BERT2FinetuneTrainer:
         wandb.finish()
 
     def sample_dataset_indices(self, dataset, sample_ratio, dataset_type):
-        """Randomly sample dataset indices"""
+        """Non-repetitive sampling, continue sampling after reset"""
+        if dataset_type == "training":
+            unsampled = self.train_unsampled_indices
+            sampled = self.train_sampled_indices
+        else:
+            unsampled = self.val_unsampled_indices
+            sampled = self.val_sampled_indices
+
         total_size = len(dataset)
         sample_size = int(total_size * sample_ratio)
-        print(f"Sampling {sample_size} out of {total_size} {dataset_type} samples ({sample_ratio*100:.1f}%)")
+
+        # If there are not enough unsampled samples, reset the sampling state
+        if len(unsampled) < sample_size:
+            print(f"Resetting {dataset_type} sampling pool after {len(sampled)} samples seen")
+            # Put the sampled samples back into the unsampled pool
+            unsampled.update(sampled)
+            sampled.clear()
+
+        # Randomly select samples from the unsampled pool
+        selected_indices = random.sample(list(unsampled), sample_size)
+
+        # Update sampled and unsampled sets
+        sampled.update(selected_indices)
+        unsampled.difference_update(selected_indices)
+
+        print(f"Sampling {sample_size} {dataset_type} samples "
+              f"({len(sampled)}/{total_size} total sampled)")
         
-        # Use NumPy for random sampling
-        return np.random.choice(total_size, sample_size, replace=False)
+        return selected_indices
 
     def create_data_loader(self, dataset, shuffle=True):
         """Create DataLoader"""
@@ -235,7 +267,6 @@ class BERT2FinetuneTrainer:
             
             if i % self.log_freq == 0:
                 wandb.log({
-                    "batch": epoch * len(train_loader) + i,
                     "batch_train_loss": loss.item(),
                     "lr": self.optim_schedule.get_last_lr()[0]
                 })
@@ -278,13 +309,6 @@ class BERT2FinetuneTrainer:
                 total_loss += loss.item()
                 accuracy = correct / total if total > 0 else 0
                 progress.set_postfix(loss=loss.item(), accuracy=accuracy)
-                
-                if i % self.log_freq == 0:
-                    wandb.log({
-                        "batch": epoch * len(val_loader) + i,
-                        "batch_val_loss": loss.item(),
-                        "batch_val_accuracy": accuracy
-                    })
         
         avg_loss = total_loss / len(val_loader)
         accuracy = correct / total
