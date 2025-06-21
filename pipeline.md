@@ -1,91 +1,97 @@
-# 数据集
-## 汇编指令归一化
-### 原始方法：CP-BCS: Binary Code Summarization Guided by Control Flow Graph and Pseudo Code
-+ Retaining all the mnemonics and registers.
-+ Replacing all the constant values with \<Positive\>, \<Negative\> and \<Zero\>.
-+ Replacing all internal functions with \<ICall\>.
-+ Replacing all the destinations of local jump with \<JumpAddress\>.
-#### 语义鸿沟问题：
+# Dataset
+## Assembly Instruction Normalization
+### Original Method: CP-BCS: Binary Code Summarization Guided by Control Flow Graph and Pseudo Code
++ Retain all mnemonics and registers.
++ Replace all constant values with `<Positive>`, `<Negative>`, and `<Zero>`.
++ Replace all internal functions with `<ICall>`.
++ Replace all destinations of local jumps with `<JumpAddress>`.
+#### Semantic Gap Issue
+The natural semantic density of assembly instructions is significantly lower than natural languages (e.g., English).  
+Example: Semantic information of `mov eax, ebx` ≈ 10-20% of an English word.  
+This makes it difficult for models to learn effective representations from sparse semantics.
 
-汇编指令的自然语义密度远低于自然语言（如英文）
+#### Special Token Dilution Issue
+After adding `<CLS>`/`<SEP>` to each block:  
++ Original instruction sequence: `["push", "ebp", "mov", "ebp", "esp"]`  
++ With special tokens (5 instructions): `["<CLS>", "push", "ebp", "mov", "ebp", "esp", "<SEP>"]`  
+  Effective instruction ratio: 5/7 ≈ 71%  
++ When blocks contain few instructions, special tokens dominate (up to 30-40%), diluting effective semantics.
 
-示例：mov eax, ebx 的语义信息量 ≈ 英文单词的 10-20%
+#### Unutilized Instruction-Level Features:
+Missing considerations:  
+Instruction types (arithmetic/logic/memory), register dependencies, memory operation modes.
 
-导致模型难以从稀疏语义中学习有效表示
+### Optimization Plan:
+#### Enhanced Semantic Representation
+Explicitly encode semantic features to compress vocabulary size.
+##### Map Opcodes to Categories
+Original: `mov` → `data_transfer:mov`  
+Add semantic categories while preserving specific opcodes.  
+Helps models understand similar operations (e.g., `mov`/`lea` both belong to data transfer).
+  + `data_transfer`: Data movement instructions (e.g., `mov`, `lea`, `xchg`) for copying data between registers/memory, calculating addresses, or swapping data.
+  + `control_flow`: Control flow instructions (e.g., `jmp`, `call`, `ret`) for jumps, function calls, returns, and conditional branches.
+  + `arith`: Arithmetic instructions (e.g., `add`, `sub`, `mul`) for integer operations.
+  + `system`: System/miscellaneous instructions (e.g., `syscall`, `cpuid`, `cli`) for system calls, interrupts, I/O, and flag operations.
+  + `logic`: Logic operations (e.g., `and`, `or`, `shl`) for bitwise manipulations.
+  + `stack`: Stack operations (e.g., `push`, `pop`) dedicated to stack management.
+  + `vector`: Vector/SIMD instructions (e.g., `vpsrld`, `paddq`) for SIMD computations (SSE/AVX).
+  + `fpu`: Floating-point unit instructions (e.g., `fsqrt`, `fadd`) for floating-point operations.
+  + `crypto`: Cryptographic instructions (e.g., `aes`, `sha`) for hardware-accelerated encryption.
+  + `nop`: No-operation instruction (`nop`) for padding or delays.
+  + `wait`: Wait instruction (`pause`) for spin-lock optimization.
+  + `string`: String operations (e.g., `movs`, `scas`) for efficient memory block handling.
+  + `bit_manip`: Bit manipulation (e.g., `popcnt`) for bit counting.
+  + `lock_prefix`: Lock prefix (e.g., `lock xadd`) for atomic operations.
+  + `rep_prefix`: Repeat prefix (e.g., `rep stosq`) for looping string operations.
+  + `bounds_prefix`: Bounds prefix (e.g., `bnd jmp`) for memory protection (MPX).
+  + `notrack_prefix`: No-track prefix (e.g., `notrack call`) to skip branch prediction.
+  + `flag_operation`: Flag operations (e.g., `setb`, `sete`) to set values based on flags.
 
-#### 特殊标记稀释问题：
+##### Register Category Mapping:
+Original `eax` → `<REG:gpr>`  
+Unifies register representations across architectures (e.g., `eax`/`rax` → `gpr`).  
+Preserves category info (general-purpose/vector/FPU/etc.).
+  - `gpr`: General-purpose registers (e.g., `rax`, `r15b`, `eax`) for data/address storage (8/16/32/64-bit).
+  - `segment`: Segment registers (e.g., `cs`, `fs`) for memory segmentation.
+  - `vector`: Vector registers (e.g., `xmm0`, `zmm15`) for SIMD operations.
+  - `mmx`: MMX registers (e.g., `mm0`) for 64-bit integer vectors (legacy SIMD).
+  - `fpu`: Floating-point registers (e.g., `st0`) for x87 instructions.
+  - `flags`: Flag registers (e.g., `eflags`) for status flags (zero/carry/overflow).
+  - `ip`: Instruction pointer (e.g., `rip`) for the next instruction address.
+  - `control`: Control registers (e.g., `cr3`) for CPU mode management.
+  - `debug`: Debug registers (e.g., `dr0`) for hardware breakpoints.
+  - `mxcsr`: MXCSR register for SIMD floating-point control.
 
-每个 block 添加 <CLS>/<SEP> 后：
-+ 原始指令序列：["push", "ebp", "mov", "ebp", "esp"]
-+ 添加特殊标记后（指令数=5）：["\<CLS\>", "push", "ebp", "mov", "ebp", "esp", "\<SEP\>"]， 有效指令占比：5/7 ≈ 71%
-+ 当 block 包含较少指令时，特殊标记占比过高（可能达 30-40%），稀释了有效语义
-#### 指令级特征未利用：
++ **Memory Operand Mapping**: 
+  + Base register: Add `BASE` prefix: `<BASE:{register type mapping}>`
+  + Index register: Add `INDEX` prefix: `<INDEX:{register type mapping}:{scale}>` (scale=1,2,4,8)
+  + Displacement classification:  
+    `disp < 2^8 → <DISP:small>`,  
+    `disp < 2^16 → <DISP:medium>`,  
+    `else → <DISP:large>`
+  + Handle no base/index: `→ <ABS_MEM>`
+  + Example: `[ebx+ecx*4+0x10] → [<BASE:gpr>+<INDEX:gpr:4>+<DISP:small>]`
 
-未考虑：指令类型（算术/逻辑/存储），寄存器依赖关系，内存操作模式
++ **Immediate Values**: Differentiate jump targets from other immediates.  
+  Immediates after jump instructions → `<TARGET>`.  
+  Other immediates by bit-width:  
+  `imm < 2^8 → <IMM:8bit>`,  
+  `imm < 2^16 → <IMM:16bit>`,  
+  `imm < 2^32 → <IMM:32bit>`,  
+  `else → <IMM:64bit>`.  
+  Example: `0x1234 → <IMM:16bit>` or `<TARGET>` (if jump target).
 
-### 优化方案：
-#### 增强语义表示
-显式编码语义特征，压缩词汇表规模
-##### 将操作码映射到不同类别
-原始: mov -> data_transfer:mov \
-保留具体操作码同时添加语义类别 \
-便于模型理解相似操作（如mov/lea同属数据传输）
-  + data_transfer: 数据传送指令（如 mov, lea, xchg），负责在寄存器/内存间复制数据、计算地址或交换数据。
-  + control_flow: 控制流指令（如 jmp, call, ret），实现跳转、函数调用、返回和条件分支。
-  + arith: 算术运算指令（如 add, sub, mul），执行整数加减乘除等基础运算。
-  + system: 系统/杂项指令（如 syscall, cpuid, cli），涵盖系统调用、中断、I/O、标志位操作等底层操作。
-  + logic: 逻辑运算指令（如 and, or, shl），执行位操作（与/或/非/移位/旋转）。
-  + stack: 栈操作指令（如 push, pop），专用于操作栈空间。
-  + vector: 向量/SIMD指令（如 vpsrld, paddq），处理SSE/AVX等SIMD并行计算（浮点/整数向量）。
-  + fpu: 浮点单元指令（如 fsqrt, fadd），执行浮点数运算和FPU栈操作。
-  + crypto: 加密指令（如 aes, sha），实现AES、SHA等硬件加速加密算法。
-  + nop: 空操作指令（nop），用于填充或延迟。
-  + wait: 等待指令（pause），优化自旋锁性能。
-  + string: 字符串操作指令（如 movs, scas），高效处理内存块（复制/比较/扫描）。
-  + bit_manip: 位操作指令（如 popcnt），统计位数或前导零。
-  + lock_prefix: 锁前缀（如 lock xadd），实现原子操作（多线程同步）。
-  + rep_prefix: 重复前缀（如 rep stosq），循环执行字符串指令。
-  + bounds_prefix: 边界前缀（如 bnd jmp），用于内存保护扩展（MPX）。
-  + notrack_prefix: 不跟踪前缀（如 notrack call），跳过间接分支预测。
-  + flag_operation: 标志操作指令（如 setb, sete），根据标志位设置字节值。  
-  
++ **Unknown Operands**: `→ <UNK_OP>`  
++ During normalization, collect unknown opcodes, registers, and operands into `unknown_opcode`, `unknown_reg`, and `unknown_operand` sets, then update mappings.
 
-##### 寄存器类别映射：
-原始 eax -> \<REG:gpr\> \
-统一不同架构寄存器表示（eax/rax → gpr） \
-保留寄存器类别信息（通用/向量/浮点等） 
-  - gpr:通用寄存器（如 rax, r15b, eax），存储数据和地址，覆盖8/16/32/64位尺寸。
-  - segment: 段寄存器（如 cs, fs），管理内存分段（代码/数据/栈段）。
-  - vector: 向量寄存器（如 xmm0, zmm15），支持SIMD指令（SSE/AVX/AVX-512）。
-  - mmx: MMX寄存器（如 mm0），处理64位整数向量（旧式SIMD）。
-  - fpu: 浮点寄存器（如 st0），存储浮点数并执行x87指令。
-  - flags: 标志寄存器（如 eflags），存储状态标志（零/进位/溢出等）。
-  - ip: 指令指针寄存器（如 rip），指向下一条执行指令的地址。
-  - control: 控制寄存器（如 cr3），管理CPU模式（分页/保护模式）。
-  - debug: 调试寄存器（如 dr0），设置硬件断点和调试状态。
-  - mxcsr: MXCSR寄存器，控制SIMD浮点运算（舍入模式/异常标志）。
-
-+ 内存操作数映射: 
-  + 基址寄存器，添加base前缀：\<BASE:\{register type mapping\}\>, 
-  + 索引寄存器：添加INDEX前缀：\<INDEX:\{register type mapping\}:\{scale\}\>, scale=1, 2, 4, 8
-  + 位移值分类 disp$\lt 2^8 \rarr$ \<DISP:small\>, disp$\lt 2^{16} \rarr$ \<DISP:medium\>, else$\rarr$ \<DISP:large\>,
-  + 处理无基址/索引的情况: $\rarr$ \<ABS_MEM\>
-  + [ebx+ecx*4+0x10] -> [\<BASE:gpr\>+\<INDEX:gpr:4\>+\<DISP:small\>]
-
-+ 立即数：区分跳转目标和其他立即数， 跳转指令后的立即数映射为\<TARGET\>，其他立即数按照位宽分类：imm$\lt 2^8 \rarr$ \<IMM:8bit\>, imm$\lt 2^{16} \rarr$ \<IMM:16bit\>, imm$\lt 2^{32} \rarr$ \<IMM:32bit\>, $else \rarr$ \<IMM:64bit\>.
-  + 0x1234 -> \<IMM:16bit\> 或者 \<TARGET\>（如果是跳转指令后的立即数）
-
-+ 未知操作数： $\rarr$ \<UNK_OP\>
-+ 在汇编指令归一化过程中，会统计所有未知的操作数，操作码和寄存器，分别收集到unkown_opcode，unknown_reg和unknown_operand三个集合中，然后更新类型映射。
-
-词汇表优化结果：
-| 元素类型   | 原始方案词汇量 | 改进方案词汇量 | 减少比例 |
-|------------|----------------|----------------|----------|
-| 操作码     | 200+           | 20+类别        | 90%      |
-| 寄存器     | 100+           | 6种类型        | 94%      |
-| 内存位移   | 无限           | 3种范围        | 100%     |
-| 立即数     | 无限           | 4种位宽        | 100%     |
-#### 使用示例
+**Vocabulary Optimization Results**:
+| Element Type   | Original Vocab Size | Improved Vocab Size | Reduction |
+|----------------|---------------------|---------------------|-----------|
+| Opcodes        | 200+                | 20+ categories      | 90%       |
+| Registers      | 100+                | 6 types            | 94%       |
+| Memory Disp.   | Infinite            | 3 ranges           | 100%      |
+| Immediates     | Infinite            | 4 bit-widths       | 100%      |
+#### Usage Example
 ```
 ; basic block 0x41d015 - 0x41d037 @ main, Dataset-1/clamav/x86-gcc-9-O3_sigtool
 0x41d015: add ebx, 0x2cdfeb              => arith:add <REG:gpr>, <IMM:32bit>
@@ -99,16 +105,12 @@
 0x41d032: call 0x4226d0                  => control_flow:call <TARGET>
 ```
 
-### 函数级处理流程
-1. 二进制分析：使用 angr 加载二进制，构建 CFG。定位目标函数（按地址或名称）。
-
-2. 函数过滤：过滤掉小于5个基本块和大于1000个基本块的函数。
-
-3. 基本块处理：按地址排序基本块。对每条指令调用归一化函数。
-
-4. 控制流提取：构建邻接矩阵（稀疏矩阵）记录块间跳转关系。
-
-5. 持久化存储：以函数为单位保存归一化指令序列、邻接矩阵到 .pkl 文件。
+### Function-Level Processing Pipeline
+1. **Binary Analysis**: Use angr to load binaries and build CFG. Locate target functions (by address/name).
+2. **Function Filtering**: Discard functions with <5 or >1000 basic blocks.
+3. **Basic Block Processing**: Sort blocks by address. Normalize each instruction.
+4. **Control Flow Extraction**: Build adjacency matrix (sparse) to record inter-block jumps.
+5. **Persistence**: Save normalized instruction sequences and adjacency matrix per function to `.pkl` files.
 ```python
 # output_x86-gcc-9-O3_sigtool.pkl
 {
@@ -131,26 +133,29 @@
     ...,
 }
 ```
-### 多进程批处理
-1. 遍历 Dataset-1 目录下的二进制文件。
-2. 选择文件名含 x86/x64 和 gcc 的文件。
-3. 使用 12 进程并行处理：
-4. 合并未知项到 unknown_opcode.json。
+### Multi-Processing Batch Processing
+1. Traverse binaries in Dataset-1 directory.
+2. Select files containing x86/x64 and gcc in filenames.
+3. Process in parallel using 12 workers.
+4. Merge unknown items into unknown_opcode.json.
 
-## 数据集划分
-### 函数级数据集分割 
-1. 遍历所有的pkl文件，为每个函数创建元组：(函数名, 编译器, 版本, 优化级别, 文件名) \
-示例：('main', 'gcc', '8.32', 'O0', 'coreutils-8.32')
-2. 数据集分割，63%训练集，27%验证集，10%测试集。
+## Dataset Splitting
+### Function-Level Dataset Split
+1. Traverse all `.pkl` files and create a tuple for each function: (function_name, compiler, version, optimization level, filename)  
+   Example: `('main', 'gcc', '8.32', 'O0', 'coreutils-8.32')`
+2. Split the dataset: 63% training set, 27% validation set, 10% test set.
 ```python
-train_val, test = train_test_split(function_list, test_size=0.1)  # 10%测试集
-train, val = train_test_split(train_val, test_size=0.3)          # 剩余70%训练/30%验证
+train_val, test = train_test_split(function_list, test_size=0.1)  # 10% test set
+train, val = train_test_split(train_val, test_size=0.3)          # Remaining 70% training / 30% 
 ```
-3. 保存分割后的结果到baseline-{train/val/test}-functions.pkl
-4. 生成相似性配对表：
-   - 正样本对：相同函数不同编译配置
-   - 负样本对：不同函数随机配对
-   - 采样控制（防止数据爆炸）：训练集每组最多5正5负，验证集每组最多2正2负，测试集每组最多3正3负。
+3. Save the split results to baseline-{train/val/test}-functions.pkl
+4. Generate similarity pairing table:
+   + Positive sample pairs: Same function under different compilation configurations
+   + Negative sample pairs: Random pairing of different functions
+   + Sampling control (to prevent data explosion):
+     - Training set: Max 5 positive + 5 negative per group
+     - Validation set: Max 2 positive + 2 negative per group
+     - Test set: Max 3 positive + 3 negative per group
 
 | anchor_function_file                  | anchor_function_name      | anchor_compiler | anchor_version | anchor_opt | target_function_file                  | target_function_name      | target_compiler | target_version | target_opt | label |
 |---------------------------------------|--------------------------|-----------------|---------------|------------|---------------------------------------|--------------------------|-----------------|---------------|------------|-------|
@@ -164,19 +169,19 @@ train, val = train_test_split(train_val, test_size=0.3)          # 剩余70%训�
 | x86-gcc-7-O0_libclamav.so.9.0.0       | FileInStream_fmap_Seek   | gcc             | 7.0           | O0         | x86-gcc-4.8-Os_ncat                  | executable_path          | gcc             | 4.8           | Os         | 0     |
 | x64-gcc-7-O0_libclamav.so.9.0.0       | FileInStream_fmap_Seek   | gcc             | 7.0           | O0         | x86-gcc-4.8-O0_ncat                  | newbox                   | gcc             | 4.8           | O0         | 0     |
 | x64-gcc-5-O0_libclamav.so.9.0.0       | FileInStream_fmap_Seek   | gcc             | 5.0           | O0         | x86-gcc-4.8-O3_libclamav.so.9.0.0    | sub_793302               | gcc             | 4.8           | O3         | 0     |
-### 数据集预处理
-1. 加载分割后的函数列表
-2. 按二进制文件分组处理
-3. 函数数据转换
+### Dataset Preprocessing
+1. Load the split function lists
+2. Group processing by binary files
+3. Function data conversion:
 ```python
-# 指令块处理，将指令块地址映射到索引
+# # Instruction block processing: Map block addresses to indices
 block_addr = sorted(addr_to_idx.keys(), key=addr_to_idx.get)
-# 拼接指令块内的指令
+# Concatenate instructions within blocks
 instruction_blocks = [
-    " <SEP> ".join(function_data[addr])  # 基本块内指令用<SEP>连接
+    " ".join(function_data[addr])  # Join instructions within a basic block
     for addr in block_addr
 ]
-# 邻接矩阵处理（COO格式）转为流式输出
+# Process adjacency matrix (COO format) to streamable output
 adj = {
     'row': adj.row.tolist(),
     'col': adj.col.tolist(),
@@ -184,29 +189,60 @@ adj = {
     'shape': adj.shape
 }
 ```
-4. 生成JSONL格式数据集
+4. Generate JSONL format dataset:
 ```json
 {
-  "instruction_blocks": ["mov eax<SEP>push ebp", ...],
-  "adjacency_matrix": {"row": [0,1], "col": [1,0], ...}
+"instruction_blocks": [
+    "stack:push <REG:gpr> ... control_flow:call <TARGET>",
+    ... , 
+    "arith:add <REG:gpr>, <IMM:8bit> ... control_flow:ret"
+    ], 
+"adjacency_matrix": {
+    "row": [4, 4, 8, 10, 10, 14, 16, 16, 20, 21, 22, 22, 24, 24, 26, 26, 27, 27], 
+    "col": [5, 9, 22, 11, 15, 22, 17, 21, 22, 27, 23, 24, 25, 26, 28, 29, 28, 29], 
+    "data": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], 
+    "shape": [30, 30]
+    }
+}
+{
+"instruction_blocks": [
+    "stack:push <REG:gpr> ... control_flow:call <TARGET>", 
+    ..., 
+    "arith:add <REG:gpr>, <IMM:16bit> ... control_flow:ret"
+    ], 
+"adjacency_matrix": {
+    "row": [1, 1, 3, 5, 8, 8, 9, 9, 10, 10, 11, 11, 15, 17, 17, 19, 21, 21, 22, 22], 
+    "col": [2, 4, 22, 9, 10, 11, 10, 11, 6, 11, 12, 16, 22, 18, 20, 22, 23, 24, 23, 24], 
+    "data": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], 
+    "shape": [25, 25]
+    }
+}
+...
+```
+5. Create function index mapping: (function_name, compiler, version, optimization, filename) → line number mapping
+```python
+{
+('afalg_create_sk', 'gcc', '4.8', 'O0', 'x64-gcc-4.8-O0_afalg.so'): 0,
+('afalg_chk_platform', 'gcc', '4.8', 'O0', 'x64-gcc-4.8-O0_afalg.so'): 1,
+('afalg_fin_cipher_aio', 'gcc', '4.8', 'O0', 'x64-gcc-4.8-O0_afalg.so'): 2,
+...
 }
 ```
-5. 创建函数索引映射: (函数名, 编译器, 版本, 优化, 文件名) → 行号映射
-6. 词汇表构建
-   1. 初始化词汇表
+6. Vocabulary construction:
+   1. Initialize vocabulary:
    ```python
    vocab = {
     "<PAD>": 0, "<CLS>": 1, "<SEP>": 2, 
     "<MASK>": 3, "<UNK>": 4, "<const>": 5
     }
    ```
-   2. 对每个函数的instruction_blocks更新词汇表
-   3. 保存词汇表
+   2. Update vocabulary for each function's **instruction_blocks**
+   3. Save vocabulary
 
-# BERT2预训练
-## BERT2模型
+# BERT2 Pretraining
+## BERT2 Model
 <div align="center">
-  <img src="./picture/deepseek_mermaid_20250620_f37303.png" alt="bert2" width="500"/>
+  <img src="./picture/20250621-173701.png" alt="bert2" width="500"/>
 </div>
 
 + BERT2 Config:
@@ -215,31 +251,43 @@ adj = {
   - Feed-forward/Hidden Dim: 256
   - Transformer Depth: 12
   - Attention Heads: 8 
-
+  - input format: `<CLS> block1 <SEP> block2... <PAD>` (padding to max length)
+## Dataset Sampling
+For each epoch, 20% of the dataset is sampled without repetition for training. Once the entire dataset has been sampled, the sampling is reset.
 ## Masked Language Model (MLM) Task
-masks the tokens on the input layer and predict them on the output layer.
-1. 对于每个函数的指令块进行采样，随机采样10个指令块，对每个指令块进行掩码处理，忽略\<SEP\>：
-   - 15% 概率替换:
-     - 80% 替换为\<MASK\>
-     - 10% 替换为随机词
-     - 10% 保持原样
-2. 在每个指令块前后添加\<CLS\>和\<SEP\>标记，用\<PAD\>填充到最大长度。
-## Adjacency Node prediction Task
-extract all adjacent blocks on a graph and randomly sample several blocks in the same graph to predict whether two blocks are adjacent.
-1. 根据邻接矩阵，生成正负样本对：
-   - 正样本对：相邻的基本块对
-   - 负样本对：随机选择不相邻的基本块对
-   - 平衡采样：确保正负样本比例1:1
-2. 构建三元组：(节点A tokens, 节点B tokens, 邻接标签)
-   - 节点A tokens: 指令块A的tokens
-   - 节点B tokens: 指令块B的tokens
-   - 邻接标签: 1表示相邻，0表示不相邻
-## Loss Function
-- MLM损失：使用交叉熵损失函数计算掩码位置的预测误差，忽略\<PAD\>标记。
-- 邻接预测损失：使用交叉熵损失函数计算正负样本对的预测误差。
-- 总损失：MLM损失 + 邻接预测损失
+Masks tokens on the input layer and predicts them on the output layer.
+1. For each function's instruction blocks, perform dynamic sampling to make block pairs:  
+   - Small functions (<30 blocks): use all blocks
+   - Medium functions (30-100 blocks): cover 70% of block pairs
+   - Large functions (>100 blocks): limit the maximum number of pairs to 80 to prevent out of memory
+   - The default is based on **40GB** GPU memory, and the sampling scale is automatically adjusted according to the actual GPU memory
+   - For sampled block pairs, concatenate each block with next block: `<CLS> block1 <SEP> block2` to generate input sequences.
+   - For each input sequences, perform random mask while ignoring `<CLS>` and `<SEP>`.  
+   - 15% probability of replacement:
+     - 80% replaced with `<MASK>`
+     - 10% replaced with a random token
+     - 10% kept unchanged
+2. Pad with `<PAD>` to the maximum length.
 
-# Supervised Fine-tuning
+## Adjacency Node Prediction Task
+Extracts all adjacent blocks in a graph and perform above sample strategy in the same graph to predict whether two blocks are adjacent.
+1. Generate positive and negative sample pairs based on the adjacency matrix:
+   - Positive sample pairs: Adjacent basic block pairs
+   - Negative sample pairs: Randomly selected non-adjacent basic block pairs
+   - imbalanced sampling: set a negative sample ratio of 5:4 to positive samples, i.e., for every 4 positive samples, 5 negative samples are generated.
+2. input: \[cls_id\] + block_A_ids+ \[sep_id\] + block_B_ids, label
+   - cls_id: `<CLS>` token ID
+   - sep_id: `<SEP>` token ID
+   - block_A_ids: Tokenize block A and convert to IDs
+   - block_B_ids: Tokenize block B and convert to IDs
+   - label: 1 = adjacent, 0 = not adjacent
+
+## Loss Function
+- MLM loss: Uses cross-entropy loss to compute prediction error at masked positions, ignoring `<CLS>` and `<PAD>` tokens.
+- ANP loss: Uses cross-entropy loss to compute prediction error for positive/negative sample pairs.
+- Total loss: MLM loss + Adjacency prediction loss
+
+# Supervised Function Similarity Learning
 ## Model Structure
 ![](./picture/20250621-005412.png)
 ## Supervised Fine-tuning
@@ -368,13 +416,13 @@ adjacency matrix is too sparse, the input of model requires dense matrix, direct
 ### Solutions
 + Implement a model which can handle sparse adjacency matrix, not solved yet.
 + select specific nodes from adjacency matrix, such as the nodes with top-k highest degree (chosen).
-+ Use spectural clustering to merge nodes into super nodes, the connectivity will become 0~1. 谱聚类可能会改变图的拓扑结构，例如将多个节点合并成一个超节点，从而破坏了原始的节点顺序（而节点顺序是论文强调的重要信息）。因此，使用谱聚类可能会损害模型性能。
-+ 删除孤立节点，压缩邻接矩阵，减少计算量。孤立节点在图中没有连接关系，删除后可以减少计算复杂度，但可能会丢失一些信息。
++ Use spectral clustering to merge nodes into super-nodes (connectivity becomes 0~1). Note: Spectral clustering may alter graph topology (e.g., merging multiple nodes into a super-node), destroying the original node order (which the paper emphasizes as important). Thus, using spectral clustering may compromise model performance.
++ Remove isolated nodes and compress adjacency matrices to reduce computation. Isolated nodes have no connections; removing them reduces computational complexity but may lose information.
 
 
 # TODO
-1. 在数据集预处理阶段就删除孤立节点，压缩邻接矩阵，减少计算量。
-2. 实现一个可以处理稀疏邻接矩阵的模型。
-3. 实现BERT4里面的 block inside graph task (BIG) and graph classification task (GC)
-   - BIG task tries to make the model judge whether two nodes exist on the same graph.
-   - GC makes the model to classify blocks in different platforms, different architectures, or different optimization options.
++ Remove isolated nodes during dataset preprocessing to compress adjacency matrices and reduce computation
++ Implement a model capable of handling sparse adjacency matrices
++ Implement BERT4's tasks:
+   - **Block Inside Graph (BIG)**: tries to make the model judge whether two nodes exist on the same graph.
+   - **Graph Classification (GC)** makes the model to classify blocks in different platforms, different architectures, or different optimization options.
