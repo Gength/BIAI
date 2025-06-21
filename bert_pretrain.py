@@ -11,11 +11,11 @@ from models.dataset import TaskDataset
 from models.collatefn import MLMCollateFn, ANPCollateFn, CombinedCollateFn
 import wandb
 class Config:
-    batch_size = 40  # RTX 4080: 10, A40: 40
-    epochs = 9
+    batch_size = 30  # RTX 4080: 10, A40: 30
+    epochs = 10
     seq_len = 128    # Maximum sequence length
-    lr = 1e-4
-    epochs = 8
+    lr = 1e-5
+    epochs = 10
     device = "cuda"
     checkpoint_save_path = os.path.join("outputs", "bert-pretrain")
     use_amp = True  # Use Automatic Mixed Precision (AMP) if available
@@ -65,7 +65,7 @@ class BERT2PretrainTrainer:
             self.optim,
             max_lr=1e-3,
             total_steps=total_steps,
-            pct_start=0.1,
+            pct_start=0.3,
             anneal_strategy="cos",
             final_div_factor=1e2,
         )
@@ -340,6 +340,7 @@ if __name__ == "__main__":
         anp_train_loader=anp_train_loader,
         mlm_valid_loader=mlm_valid_loader,
         anp_valid_loader=anp_valid_loader,
+        lr=config.lr,
         num_epochs=config.epochs,
         model_save_path=config.checkpoint_save_path,
         device=config.device,

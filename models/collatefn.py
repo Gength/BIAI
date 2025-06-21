@@ -14,19 +14,40 @@ class MLMCollateFn:
         labels_output = []
         for batch in batches:
             instruction_blocks = batch["instruction_blocks"]
-            mlm_dataset = BERTMLMDataset(instruction_blocks, self.tokenizer, max_len=self.seq_len, train=self.train)
-            if len(mlm_dataset) > 0:
-                n_samples = min(len(mlm_dataset), self.samples_per_batch)
-                idx_set = random.sample(range(len(mlm_dataset)), n_samples)
-                for idx in idx_set:
-                    ids, labels = mlm_dataset[idx]
-                    ids_output.append(ids)
-                    labels_output.append(labels)
+            mlm_dataset = BERTMLMDataset(
+                instruction_blocks, 
+                self.tokenizer, 
+                max_len=self.seq_len, 
+                train=self.train
+            )
+            n_samples = len(mlm_dataset)
+            if n_samples == 0:
+                continue
+            
+            # Determine the actual number of samples
+            actual_samples = min(n_samples, self.samples_per_batch)
+            
+            # Randomly select the starting index
+            if n_samples > actual_samples:
+                start_idx = random.randint(0, n_samples - actual_samples)
+            else:
+                start_idx = 0
+            
+            # Sample consecutively
+            for idx in range(start_idx, start_idx + actual_samples):
+                ids, labels = mlm_dataset[idx]
+                ids_output.append(ids)
+                labels_output.append(labels)
+        
         # Handle empty batch case
         if len(ids_output) == 0:
-            return torch.tensor([]), torch.tensor([])
-
-        # ids_output and labels_output are lists, convert to tensors
+            return {
+                'task_type': 'mlm',
+                "input_ids": torch.tensor([]),
+                "labels": torch.tensor([])
+            }
+        
+        # Convert lists to tensors
         ids_output = torch.stack(ids_output, dim=0)
         labels_output = torch.stack(labels_output, dim=0)
         return {
