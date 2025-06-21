@@ -37,15 +37,17 @@ class BERTANPDataset(Dataset):
 		text_a_idx, text_b_idx = self.pairs[idx]
 		text_a = self.instr_blocks[text_a_idx]
 		text_b = self.instr_blocks[text_b_idx]
+		text = "<CLS> " + text_a + " <SEP> " + text_b
 
-		ids_a = tokenize_and_pad(text_a, self.tokenizer, self.max_len)
-		ids_b = tokenize_and_pad(text_b, self.tokenizer, self.max_len)
-
-		ids_a = torch.tensor(ids_a, dtype=torch.long)
-		ids_b = torch.tensor(ids_b, dtype=torch.long)
+		ids = self.tokenizer.encode(text)
+		ids = ids[:self.max_len]  # Truncate to max_len
+		pad_len = self.max_len - len(ids)
+		if pad_len > 0:
+			ids += [self.tokenizer.pad_token_id] * pad_len
+		ids = torch.tensor(ids, dtype=torch.int)
 
 		label = torch.tensor(self.adj[text_a_idx, text_b_idx], dtype=torch.long)
-		return ids_a, ids_b, label
+		return ids, label
 
 class TaskDataset(Dataset):
 	'''Wrap the dataset and add task type information'''

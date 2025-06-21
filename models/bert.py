@@ -322,21 +322,19 @@ class ANPHead(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 2)
         )
 
-    def forward(self, vec_a, vec_b):
+    def forward(self, vec):
         """
         Inputs:
-            vec_a: block embedding [batch_size, d_model]
-            vec_b: block embedding [batch_size, d_model]
+            vec: block embedding [batch_size, d_model]
         Output: 
             adjacency logits [batch_size, 2]
         """
-        x = torch.cat([vec_a, vec_b], dim=1)
-        return self.classifier(x)
+        return self.classifier(vec)
 	
 class BERT2(BERT):
     def __init__(self, vocab_size, d_model=128, n_layers=12, 
@@ -360,26 +358,23 @@ class BERT2(BERT):
             return self.forward_mlm(input_dict['input_ids'], input_dict['labels'])
         elif task_type == 'anp':
             return self.forward_anp(
-                input_dict['input_a'], 
-                input_dict['input_b'], 
+                input_dict['input_ids'], 
                 input_dict['labels']
             )
         else:
             raise ValueError(f"Unknown Task Type: {task_type}")
 
-    def forward_anp(self, input_a, input_b, labels):
+    def forward_anp(self, input, labels):
         """
         judge whether two blocks are adjacent in a graph
         Inputs (assumed to be on correct device):
-            input_a: block A tokens [batch_size, seq_len]
-            input_b: block B tokens [batch_size, seq_len]
+            input: concatenated 2 block tokens [batch_size, seq_len]
             labels: adjacency labels [batch_size]
         Output: 
             (loss, logits) where logits [batch_size, 2]
         """
-        vec_a = self.encode(input_a)
-        vec_b = self.encode(input_b)
-        logits = self.anp_head(vec_a, vec_b)
+        vec = self.encode(input)
+        logits = self.anp_head(vec)
         loss = F.cross_entropy(logits, labels)
         return loss, logits
 
