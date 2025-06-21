@@ -11,59 +11,6 @@ import pickle
 import os
 from scipy.sparse import coo_matrix
 import heapq
-class BERTMLMDataset(Dataset):
-	def __init__(self, instr_blocks, tokenizer:AsmTokenizer, max_len=128, train=True):
-		self.tokenizer = tokenizer
-		self.max_len = max_len
-		self.instr_blocks = instr_blocks
-		self.train = train
-
-
-	def __len__(self):
-		return len(self.instr_blocks)
-		
-	def random_mask(self, ids):
-		output = []
-		labels = []
-		for id in ids:
-			if id == self.tokenizer.sep_token_id:
-				output.append(id)
-				labels.append(0)
-			if random.random() < 0.15:
-				rand_val = random.random()
-				if rand_val < 0.8:
-					output.append(self.tokenizer.mask_token_id)  # 80% Replace with MASK
-				elif rand_val < 0.9:
-					output.append(random.choice(list(self.tokenizer.vocab.values())))  # 10% Random token
-				else:
-					output.append(id)  # 10% Keep original
-				labels.append(id)
-			else:
-				output.append(id)
-				labels.append(0)
-		assert(len(output) == len(labels))
-		return output, labels
-		
-	def __getitem__(self, idx):
-		text = self.instr_blocks[idx]
-		ids: list = self.tokenizer.encode(text)
-		if self.train:
-			ids, labels = self.random_mask(ids)
-		else:
-			labels = ids.copy()
-		# Reserve [CLS] and [SEP], truncate original tokens
-		ids = ids[:self.max_len - 2]
-		labels = labels[:self.max_len - 2]
-		pad_len = self.max_len - len(ids) - 2  # minus <CLS> and <SEP>
-		ids = [self.tokenizer.cls_token_id] + ids + [self.tokenizer.sep_token_id]
-		labels = [0] + labels + [0]
-
-		ids += [self.tokenizer.pad_token_id] * pad_len
-		labels += [0] * pad_len
-
-		ids = torch.tensor(ids, dtype=torch.long)
-		labels = torch.tensor(labels, dtype=torch.long)
-		return ids, labels
 
 class BERTANPDataset(Dataset):
 	def __init__(self, instr_blocks, tokenizer:AsmTokenizer, adj, max_len=128):

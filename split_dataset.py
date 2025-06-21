@@ -162,7 +162,7 @@ def process_split_datasets(split):
                 instruction_blocks = []
                 for instr_key in block_addr:
                     block = function_data[instr_key]
-                    instructions = " <SEP> ".join(block)
+                    instructions = " ".join(block)
                     instruction_blocks.append(instructions)
                 output_obj['instruction_blocks'] = instruction_blocks
                 

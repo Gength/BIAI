@@ -1,43 +1,77 @@
-import numpy as np
 import torch
 import random
-from models.dataset import BERTMLMDataset, BERTANPDataset
+from models.dataset import BERTANPDataset
+from models.tokenizer import AsmTokenizer
 class MLMCollateFn:
-    def __init__(self, tokenizer, seq_len=128, train=True, samples_per_batch=10):
+    def __init__(self, tokenizer: AsmTokenizer, seq_len=128, train=True, samples_per_batch=10):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.train = train
         self.samples_per_batch = samples_per_batch
 
+    def random_mask(self, ids):
+        output = []
+        labels = []
+        for token_id in ids:
+            if token_id == self.tokenizer.sep_token_id or token_id == self.tokenizer.cls_token_id:
+                output.append(token_id)
+                labels.append(0)
+            elif random.random() < 0.15:
+                rand_val = random.random()
+                if rand_val < 0.8:
+                    output.append(self.tokenizer.mask_token_id)  # 80% replaced with MASK
+                elif rand_val < 0.9:
+                    output.append(random.choice(list(self.tokenizer.vocab.values())))  # 10% random token
+                else:
+                    output.append(token_id)  # 10% keep original
+                labels.append(token_id)
+            else:
+                output.append(token_id)
+                labels.append(0)
+        return output, labels
+
     def __call__(self, batches):
         ids_output = []
         labels_output = []
+        
         for batch in batches:
             instruction_blocks = batch["instruction_blocks"]
-            mlm_dataset = BERTMLMDataset(
-                instruction_blocks, 
-                self.tokenizer, 
-                max_len=self.seq_len, 
-                train=self.train
-            )
-            n_samples = len(mlm_dataset)
-            if n_samples == 0:
-                continue
+            n_blocks = len(instruction_blocks)
             
-            # Determine the actual number of samples
-            actual_samples = min(n_samples, self.samples_per_batch)
+            # At least 2 blocks are needed to form sample pairs
+            if n_blocks < 2:
+                continue
+                
+            # Calculate the actual number of blocks that can be sampled
+            n_blocks_needed = min(n_blocks, self.samples_per_batch + 1)
             
             # Randomly select the starting index
-            if n_samples > actual_samples:
-                start_idx = random.randint(0, n_samples - actual_samples)
-            else:
-                start_idx = 0
+            start_idx = random.randint(0, n_blocks - n_blocks_needed) if n_blocks > n_blocks_needed else 0
+            sampled_blocks = instruction_blocks[start_idx:start_idx + n_blocks_needed]
             
-            # Sample consecutively
-            for idx in range(start_idx, start_idx + actual_samples):
-                ids, labels = mlm_dataset[idx]
-                ids_output.append(ids)
-                labels_output.append(labels)
+            # Create samples for each pair of adjacent blocks
+            for i in range(len(sampled_blocks) - 1):
+                # Concatenate the current block and the next block, add special tokens
+                text = "<CLS> " + sampled_blocks[i] + " <SEP> " + sampled_blocks[i+1]
+                ids = self.tokenizer.encode(text)
+                
+                # Apply mask (if in training mode)
+                if self.train:
+                    ids, labels = self.random_mask(ids)
+                else:
+                    labels = ids.copy()
+                
+                # Truncate and pad
+                ids = ids[:self.seq_len]
+                labels = labels[:self.seq_len]
+                
+                pad_len = self.seq_len - len(ids)
+                if pad_len > 0:
+                    ids += [self.tokenizer.pad_token_id] * pad_len
+                    labels += [0] * pad_len
+                
+                ids_output.append(torch.tensor(ids, dtype=torch.long))
+                labels_output.append(torch.tensor(labels, dtype=torch.long))
         
         # Handle empty batch case
         if len(ids_output) == 0:
@@ -47,9 +81,10 @@ class MLMCollateFn:
                 "labels": torch.tensor([])
             }
         
-        # Convert lists to tensors
+        # Stack all samples
         ids_output = torch.stack(ids_output, dim=0)
         labels_output = torch.stack(labels_output, dim=0)
+        
         return {
             'task_type': 'mlm',
             "input_ids": ids_output,
