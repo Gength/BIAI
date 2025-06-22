@@ -1,17 +1,15 @@
 import torch
 import random
 from models.tokenizer import AsmTokenizer
-from utils.utility import random_mask
+from utils.utility import random_mask, pad_sequence
 from scipy.sparse import lil_matrix
 import numpy as np
 class MLMCollateFn:
-    def __init__(self, tokenizer: AsmTokenizer, seq_len=128, train=True, min_samples=20, max_samples=80, coverage_ratio=0.7):
+    def __init__(self, tokenizer: AsmTokenizer, seq_len=128, train=True, max_samples=50):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.train = train
-        self.min_samples = min_samples  # Minimum samples for small functions
-        self.max_samples = max_samples  # Maximum samples for large functions
-        self.coverage_ratio = coverage_ratio  # Target coverage ratio
+        self.max_samples = max_samples
 
     def __call__(self, batches):
         ids_output = []
@@ -20,54 +18,35 @@ class MLMCollateFn:
         for batch in batches:
             instruction_blocks = batch["instruction_blocks"]
             n_blocks = len(instruction_blocks)
-            
-            # Dynamically calculate the number of samples (based on the number of blocks)
-            if n_blocks <= 30:  # Small function
-                n_samples = min(n_blocks - 1, self.max_samples)
-            elif n_blocks <= 100:  # Medium function
-                n_samples = min(
-                    max(self.min_samples, int(n_blocks * self.coverage_ratio)),
-                    self.max_samples
-                )
-            else:  # Large function
-                n_samples = self.max_samples
-            
-            # Stratified sampling strategy
-            sampled_pairs = set()
-            for _ in range(n_samples):
-                # Randomly select start position
-                start_idx = random.randint(0, n_blocks - 2)
-                pair = (start_idx, start_idx + 1)
+            # Calculate the number of available block pairs (total consecutive block pairs)
+            available_pairs = n_blocks - 1
                 
-                # Ensure not to sample the same block pair repeatedly
-                if pair not in sampled_pairs:
-                    sampled_pairs.add(pair)
-                    text = "<CLS> " + instruction_blocks[start_idx] + " <SEP> " + instruction_blocks[start_idx+1]
-                    ids = self.tokenizer.encode(text)
-                    
-                    if self.train:
-                        ids, labels = random_mask(ids, self.tokenizer)
-                    else:
-                        labels = ids.copy()
-                    
-                    # Truncate and pad
-                    ids = ids[:self.seq_len]
-                    labels = labels[:self.seq_len]
-                    pad_len = self.seq_len - len(ids)
-                    if pad_len > 0:
-                        ids += [self.tokenizer.pad_token_id] * pad_len
-                        labels += [0] * pad_len
-                    
-                    ids_output.append(torch.tensor(ids, dtype=torch.int))
-                    labels_output.append(torch.tensor(labels, dtype=torch.long))
-        
-        # Handle empty batch
-        if len(ids_output) == 0:
-            return {
-                'task_type': 'mlm',
-                "input_ids": torch.tensor([]),
-                "labels": torch.tensor([])
-            }
+            # Determine the actual number of samples (not exceeding available pairs and max_samples)
+            n_samples = min(available_pairs, self.max_samples)
+            
+            # Generate all possible start indices (0 to n_blocks-2)
+            all_start_indices = list(range(available_pairs))
+            # Directly sample non-repeating start indices
+            sampled_start_indices = random.sample(all_start_indices, n_samples)
+            random.shuffle(sampled_start_indices)  # Shuffle the order
+            
+            for start_idx in sampled_start_indices:
+                text = "<CLS> " + instruction_blocks[start_idx] + " <SEP> " + instruction_blocks[start_idx+1]
+                ids = self.tokenizer.encode(text)
+                
+                if self.train:
+                    ids, labels = random_mask(ids, self.tokenizer)
+                else:
+                    labels = ids.copy()
+                
+                # Truncate and pad
+                ids = ids[:self.seq_len]
+                labels = labels[:self.seq_len]
+                ids = pad_sequence(ids, self.seq_len, self.tokenizer.pad_token_id)
+                labels = pad_sequence(labels, self.seq_len, 0) # Note: label for padding part should be 0 (ignore loss)
+                
+                ids_output.append(torch.tensor(ids, dtype=torch.int))
+                labels_output.append(torch.tensor(labels, dtype=torch.long))
         
         return {
             'task_type': 'mlm',
@@ -76,10 +55,9 @@ class MLMCollateFn:
         }
 
 class ANPCollateFn:
-    def __init__(self, tokenizer, seq_len=128, min_samples=15, max_samples=60, train=True):
+    def __init__(self, tokenizer, seq_len=128, max_samples=50, train=True):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
-        self.min_samples = min_samples
         self.max_samples = max_samples
         self.train = train
 
@@ -99,56 +77,74 @@ class ANPCollateFn:
             # Extract positive pairs
             positive_pairs = list(zip(adj['row'], adj['col']))
             n_pos = len(positive_pairs)
+            n_blocks = shape[0]  # Get the number of basic blocks
             
-            # Skip function with no positive pairs
+            # Handle the case with no positive pairs (n_pos == 0)
             if n_pos == 0:
-                continue
+                # Calculate the maximum possible number of negative pairs (avoid self-loops)
+                max_neg_pairs = n_blocks * (n_blocks - 1)
+                n_neg_samples = min(self.max_samples, max_neg_pairs)
                 
-            # Generate negative pairs (equal count to positive pairs)
-            block_ids = list(range(shape[0]))
-            negative_pairs = []
-            while len(negative_pairs) < n_pos:
-                i, j = random.sample(block_ids, 2)
-                if adj_matrix[i, j] == 0:  # Ensure no edge exists
-                    negative_pairs.append((i, j))
+                # Directly generate non-repeating negative pairs
+                negative_pairs = set()
+                while len(negative_pairs) < n_neg_samples:
+                    i, j = random.sample(range(n_blocks), 2)
+                    # Ensure not a self-loop and is a new negative pair
+                    if i != j and (i, j) not in negative_pairs:
+                        negative_pairs.add((i, j))
+                
+                all_pairs = list(negative_pairs)
+                pair_labels = [0] * len(negative_pairs)  # All labels are 0 (negative pairs)
             
-            # Calculate balanced sample count
-            total_samples = min(max(self.min_samples, 2 * n_pos), self.max_samples)
-            total_samples = total_samples // 2 * 2  # Ensure even number
-            n_samples = min(total_samples, 2 * n_pos)
-            half_samples = n_samples // 2
+            # Handle the case with positive pairs
+            else:
+                # Generate negative pairs (same number as positive pairs)
+                negative_pairs = set()
+                while len(negative_pairs) < n_pos:
+                    i, j = random.sample(range(n_blocks), 2)
+                    # Ensure not a self-loop, no edge, and is a new negative pair
+                    if i != j and adj_matrix[i, j] == 0 and (i, j) not in negative_pairs:
+                        negative_pairs.add((i, j))
+                
+                negative_pairs = list(negative_pairs)
+                
+                # Calculate balanced sampling size
+                total_samples = min(2 * n_pos, self.max_samples)
+                total_samples = total_samples // 2 * 2  # Ensure even number
+                half_samples = total_samples // 2
+                
+                # Sample positive and negative pairs
+                pos_sample = random.sample(positive_pairs, min(half_samples, n_pos))
+                neg_sample = random.sample(negative_pairs, min(half_samples, n_pos))
+                
+                all_pairs = pos_sample + neg_sample
+                pair_labels = [1] * len(pos_sample) + [0] * len(neg_sample)
+                
+                # Shuffle the order
+                combined = list(zip(all_pairs, pair_labels))
+                random.shuffle(combined)
+                all_pairs, pair_labels = zip(*combined) if combined else ([], [])
             
-            # Sample positive and negative pairs
-            pos_sample = random.sample(positive_pairs, min(half_samples, n_pos))
-            neg_sample = random.sample(negative_pairs, min(half_samples, n_pos))
-            all_pairs = pos_sample + neg_sample
-            pair_labels = [1] * len(pos_sample) + [0] * len(neg_sample)
-            
-            # Shuffle pairs and labels together
-            combined = list(zip(all_pairs, pair_labels))
-            random.shuffle(combined)
-            all_pairs, pair_labels = zip(*combined) if combined else ([], [])
-            
-            # Process each pair
+            # Process each block pair
             for (i, j), label in zip(all_pairs, pair_labels):
-                # Format and tokenize instructions
+                # Format and encode text
                 text = "<CLS> " + instruction_blocks[i] + " <SEP> " + instruction_blocks[j]
                 ids = self.tokenizer.encode(text)
                 
-                # Apply masking during training
+                # Apply random mask during training
                 if self.train:
                     ids, _ = random_mask(ids, self.tokenizer)
                 
-                # Truncate and pad sequences
+                # Truncate and pad
                 ids = ids[:self.seq_len]
-                padding = [self.tokenizer.pad_token_id] * (self.seq_len - len(ids))
-                ids_tensor = torch.tensor(ids + padding, dtype=torch.int)
+                ids = pad_sequence(ids, self.seq_len, self.tokenizer.pad_token_id)
+                ids_tensor = torch.tensor(ids, dtype=torch.int)
                 label_tensor = torch.tensor(label, dtype=torch.long)
                 
                 ids_output.append(ids_tensor)
                 labels_output.append(label_tensor)
         
-        # Handle empty batch case
+        # Handle empty batch
         if not ids_output:
             return {
                 'task_type': 'anp',
@@ -163,10 +159,9 @@ class ANPCollateFn:
         }
 
 class BIGCollateFn:
-    def __init__(self, tokenizer, seq_len=128, min_samples=15, max_samples=60, train=True):
+    def __init__(self, tokenizer, seq_len=128, max_samples=50, train=True):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
-        self.min_samples = min_samples
         self.max_samples = max_samples
         self.train = train
 
@@ -183,11 +178,16 @@ class BIGCollateFn:
                 continue  # Skip functions with only one block
                 
             # Determine the number of samples
-            n_samples = min(max(self.min_samples, n_blocks//2), self.max_samples)
-            
-            for _ in range(n_samples):
+            n_pos_samples = min(n_blocks//2, self.max_samples)
+            n_pos_sample_idx = set()
+            while len(n_pos_sample_idx) < n_pos_samples:
                 # Randomly select two different blocks
                 i, j = random.sample(range(n_blocks), 2)
+                if i == j or (i, j) in n_pos_sample_idx or (j, i) in n_pos_sample_idx:
+                    continue
+                n_pos_sample_idx.add((i, j))
+            
+            for i,j in n_pos_sample_idx:
                 block1 = instruction_blocks[i]
                 block2 = instruction_blocks[j]
                 
@@ -203,15 +203,14 @@ class BIGCollateFn:
                 
                 # Truncate and pad
                 masked_ids = masked_ids[:self.seq_len]
-                pad_len = self.seq_len - len(masked_ids)
-                if pad_len > 0:
-                    masked_ids += [self.tokenizer.pad_token_id] * pad_len
+                masked_ids = pad_sequence(masked_ids, self.seq_len, self.tokenizer.pad_token_id)
                 
                 # Add as positive sample (label 1)
                 samples.append((torch.tensor(masked_ids, dtype=torch.long), 1))
         
         # Generate negative samples (block pairs from different functions)
         n_neg_samples = len(samples)  # Match number of positive samples
+        # The probability of sampling the same block pair from the same function twice is very low, so deduplication is not performed
         for _ in range(n_neg_samples):
             # Randomly select two different functions
             func_idx1, func_idx2 = random.sample(range(len(batches)), 2)
@@ -238,9 +237,7 @@ class BIGCollateFn:
             
             # Truncate and pad
             masked_ids = masked_ids[:self.seq_len]
-            pad_len = self.seq_len - len(masked_ids)
-            if pad_len > 0:
-                masked_ids += [self.tokenizer.pad_token_id] * pad_len
+            masked_ids = pad_sequence(masked_ids, self.seq_len, self.tokenizer.pad_token_id)
             
             # Add as negative sample (label 0)
             samples.append((torch.tensor(masked_ids, dtype=torch.int), 0))
@@ -266,10 +263,9 @@ class BIGCollateFn:
         }
 
 class GCCollateFn:
-    def __init__(self, tokenizer, seq_len=128, min_samples=10, max_samples=40):
+    def __init__(self, tokenizer, seq_len=128, max_samples=50):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
-        self.min_samples = min_samples
         self.max_samples = max_samples
 
     def __call__(self, batches):
@@ -282,16 +278,14 @@ class GCCollateFn:
             n_blocks = len(instruction_blocks)
             
             # Determine sample size
-            n_samples = min(max(self.min_samples, n_blocks), self.max_samples)
+            n_samples = min(n_blocks, self.max_samples)
             sampled_blocks = random.sample(instruction_blocks, min(n_samples, n_blocks))
             
             for block in sampled_blocks:
                 text = "<CLS> " + block
                 ids = self.tokenizer.encode(text)
                 ids = ids[:self.seq_len]
-                pad_len = self.seq_len - len(ids)
-                if pad_len > 0:
-                    ids += [self.tokenizer.pad_token_id] * pad_len
+                ids = pad_sequence(ids, self.seq_len, self.tokenizer.pad_token_id)
                 input_ids_list.append(torch.tensor(ids, dtype=torch.int))
                 labels_list.append(opt_arch_idx)
  

@@ -6,9 +6,6 @@ from models.dataset import FunctionDataset
 from models.trainer import BERT4PretrainTrainer
 from models.dataset import opt_arch_combinations
 
-# Dynamically adjust parameters based on hardware resources
-gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-
 class Config:
     batch_size = 10
     epochs = 12
@@ -26,8 +23,6 @@ class Config:
     wandb_project = "bert4-training"  # Weights & Biases project name
     train_sample_ratio = 0.2  # 20% training set sampling ratio
     val_sample_ratio = 0.2    # 20% validation set sampling ratio
-    def __init__(self, gpu_memory):
-        self.mem_factor = max(0.5, min(1.0, gpu_memory / 40))
 
 # Dummy context manager for non-mixed precision training
 class dummy_context:
@@ -38,7 +33,7 @@ class dummy_context:
 
 if __name__ == "__main__":
     gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
-    config = Config(gpu_mem)
+    config = Config()
     tokenizer = AsmTokenizer(
         vocab_file=os.path.join("outputs", f"baseline-vocab.txt")
     )

@@ -3,6 +3,7 @@ import random
 import math
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import Adam
 from models.collatefn import MLMCollateFn, ANPCollateFn, BIGCollateFn, GCCollateFn, CombinedCollateFn
@@ -69,17 +70,20 @@ class BERT2PretrainTrainer:
         else:
             os.environ["WANDB_MODE"] = "disabled"  # Disable Weights & Biases logging
         # Initialize wandb
-        wandb.init(project=config.wandb_project, config={
-            "name": config.wandb_run,
-            "learning_rate": config.lr,
-            "weight_decay": config.weight_decay,
-            "batch_size": config.batch_size,
-            "epochs": self.epochs,
-            "device": self.device,
-            "train_sample_ratio": config.train_sample_ratio,
-            "val_sample_ratio": config.val_sample_ratio,
-            "total_training_steps": total_steps
-        })
+        wandb.init(
+            project=config.wandb_project, 
+            name=config.wandb_run,
+            config={
+                "learning_rate": config.lr,
+                "weight_decay": config.weight_decay,
+                "batch_size": config.batch_size,
+                "epochs": self.epochs,
+                "device": self.device,
+                "train_sample_ratio": config.train_sample_ratio,
+                "val_sample_ratio": config.val_sample_ratio,
+                "total_training_steps": total_steps
+            }
+        )
         wandb.watch(self.model, log=None)
         os.makedirs(self.model_save_path, exist_ok=True)
         
@@ -87,16 +91,11 @@ class BERT2PretrainTrainer:
         self.mlm_collate = MLMCollateFn(
             tokenizer, 
             config.seq_len, 
-            train=True,
-            min_samples=int(20 * config.mem_factor),
-            max_samples=int(80 * config.mem_factor),
-            coverage_ratio=0.7
+            train=True
             )
         self.anp_collate = ANPCollateFn(
             tokenizer, 
-            config.seq_len,
-            min_samples=int(15 * config.mem_factor),
-            max_samples=int(60 * config.mem_factor),
+            config.seq_len
             )
         self.combined_collate = CombinedCollateFn(self.mlm_collate, self.anp_collate)
         
@@ -353,14 +352,10 @@ class BERT4PretrainTrainer(BERT2PretrainTrainer):
         self.big_collate = BIGCollateFn(
             tokenizer, 
             config.seq_len,
-            min_samples=int(15 * config.mem_factor),
-            max_samples=int(60 * config.mem_factor)
         )
         self.gc_collate = GCCollateFn(
             tokenizer, 
             config.seq_len,
-            min_samples=int(10 * config.mem_factor),
-            max_samples=int(40 * config.mem_factor)
         )
         
         # Update combined_collate to support four tasks
@@ -370,15 +365,6 @@ class BERT4PretrainTrainer(BERT2PretrainTrainer):
             self.big_collate,
             self.gc_collate
         )
-        
-        # Update wandb config
-        if config.use_wandb:
-            wandb.config.update({
-                "big_min_samples": int(15 * config.mem_factor),
-                "big_max_samples": int(60 * config.mem_factor),
-                "gc_min_samples": int(10 * config.mem_factor),
-                "gc_max_samples": int(40 * config.mem_factor)
-            })
     
     def create_dataloader(self, dataset, batch_size, shuffle=True):
         """Create DataLoader (override parent method)"""
@@ -658,3 +644,280 @@ class BERT4PretrainTrainer(BERT2PretrainTrainer):
         avg_epoch_loss = total_loss / total_batches if total_batches > 0 else float('inf')
         print(f"Epoch {epoch+1} Valid loss: {avg_epoch_loss:.4f}")
         return avg_epoch_loss
+    
+
+class BERTFinetuneTrainer:
+    def __init__(
+        self,
+        model,
+        train_dataset,  # Full training dataset
+        val_dataset,    # Full validation dataset
+        config
+    ):
+        self.config = config
+        self.device = config.device
+        self.model = model.to(self.device)
+        self.train_dataset = train_dataset  # Save full training dataset
+        self.val_dataset = val_dataset      # Save full validation dataset
+        self.log_freq = config.log_freq
+        self.num_epochs = config.epochs
+        self.model_save_path = config.checkpoint_save_path
+        self.use_amp = config.use_amp
+        self.best_accuracy = 0
+        self.best_val_loss = float('inf')
+        
+        # DataLoader parameters
+        self.batch_size = config.batch_size
+        
+        # Sampling seed
+        self.sample_seed = 42
+        
+        # Initialize sampling state
+        self.train_sampled_indices = set()
+        self.train_unsampled_indices = set(range(len(train_dataset)))
+        self.val_sampled_indices = set()
+        self.val_unsampled_indices = set(range(len(val_dataset)))
+        
+        # Optimizer and loss function
+        self.optimizer = Adam(
+            self.model.parameters(), 
+            lr=config.lr, 
+            betas=config.betas, 
+            weight_decay=config.weight_decay
+        )
+        self.criterion = nn.BCEWithLogitsLoss()
+        
+        # Calculate total global steps
+        train_samples_per_epoch = int(len(train_dataset) * config.train_sample_ratio)
+        steps_per_epoch = math.ceil(train_samples_per_epoch / config.batch_size)
+        total_steps = steps_per_epoch * config.epochs
+
+        # Initialize global learning rate scheduler
+        self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=1e-3,
+            total_steps=total_steps,
+            pct_start=0.3,
+            anneal_strategy="cos",
+            final_div_factor=1e2,
+            div_factor=25,
+            three_phase=False
+        )
+        
+        # Mixed precision training
+        if self.use_amp:
+            self.scaler = torch.amp.GradScaler('cuda')
+        else:
+            self.scaler = None
+            
+        # Initialize wandb if enabled
+        if config.use_wandb:
+            os.environ["WANDB_MODE"] = "online"
+            wandb.init(
+                project=config.wandb_project,
+                config={
+                    "batch_size": config.batch_size,
+                    "learning_rate": config.lr,
+                    "epochs": config.epochs,
+                    "device": config.device,
+                    "train_sample_ratio": config.train_sample_ratio,
+                    "val_sample_ratio": config.val_sample_ratio,
+                    "total_training_steps": total_steps
+                }
+            )
+            wandb.run.name = config.wandb_run
+            wandb.watch(self.model, log=None)
+        else:
+            os.environ["WANDB_MODE"] = "disabled"
+        
+        # Ensure output directory exists
+        os.makedirs(config.checkpoint_save_path, exist_ok=True)
+
+    def train(self):
+        print(f"Starting training on {self.device}...")
+        for epoch in range(self.num_epochs):
+            print(f"\nEpoch {epoch+1}/{self.num_epochs}")
+            
+            # Set random seed for reproducibility
+            self.sample_seed = epoch + 1
+            torch.manual_seed(self.sample_seed)
+            np.random.seed(self.sample_seed)
+            random.seed(self.sample_seed)
+            
+            # Sample training set
+            train_indices = self.sample_dataset_indices(
+                self.train_dataset, 
+                self.config.train_sample_ratio,
+                "training"
+            )
+            
+            # Sample validation set
+            val_indices = self.sample_dataset_indices(
+                self.val_dataset, 
+                self.config.val_sample_ratio,
+                "validation"
+            )
+            
+            # Create sampled datasets
+            train_subset = Subset(self.train_dataset, train_indices)
+            val_subset = Subset(self.val_dataset, val_indices)
+            
+            # Create DataLoaders
+            train_loader = self.create_data_loader(train_subset, shuffle=True)
+            val_loader = self.create_data_loader(val_subset, shuffle=False)
+            
+            # Training phase
+            train_loss = self.train_epoch(epoch, train_loader)
+            
+            # Validation phase
+            val_loss, val_acc = self.validate_epoch(epoch, val_loader)
+            
+            # Log epoch metrics to wandb
+            if self.config.use_wandb:
+                wandb.log({
+                    "epoch": epoch + 1,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "val_accuracy": val_acc,
+                })
+            
+            # Save best model
+            if val_acc > self.best_accuracy:
+                self.best_accuracy = val_acc
+                model_save_path = os.path.join(self.model_save_path, "CFGFusion-best.pth")
+                torch.save(self.model.state_dict(), model_save_path)
+                print(f"Saved new best model with accuracy {val_acc:.4f}")
+            
+            # Save checkpoint
+            checkpoint_save_path = os.path.join(self.model_save_path, f"CFGFusion-epoch-{epoch}.pth")
+            torch.save(self.model.state_dict(), checkpoint_save_path)
+        
+        print("Training completed!")
+        if self.config.use_wandb:
+            wandb.finish()
+
+    def sample_dataset_indices(self, dataset, sample_ratio, dataset_type):
+        """Non-repetitive sampling, continue sampling after reset"""
+        if dataset_type == "training":
+            unsampled = self.train_unsampled_indices
+            sampled = self.train_sampled_indices
+        else:
+            unsampled = self.val_unsampled_indices
+            sampled = self.val_sampled_indices
+
+        total_size = len(dataset)
+        sample_size = int(total_size * sample_ratio)
+
+        # If there are not enough unsampled samples, reset the sampling state
+        if len(unsampled) < sample_size:
+            print(f"Resetting {dataset_type} sampling pool after {len(sampled)} samples seen")
+            # Put the sampled samples back into the unsampled pool
+            unsampled.update(sampled)
+            sampled.clear()
+
+        # Randomly select samples from the unsampled pool
+        selected_indices = random.sample(list(unsampled), sample_size)
+
+        # Update sampled and unsampled sets
+        sampled.update(selected_indices)
+        unsampled.difference_update(selected_indices)
+
+        print(f"Sampling {sample_size} {dataset_type} samples "
+              f"({len(sampled)}/{total_size} total sampled)")
+        
+        return selected_indices
+
+    def create_data_loader(self, dataset, shuffle=True):
+        """Create DataLoader"""
+        return DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+            num_workers=6,
+            prefetch_factor=3,
+            persistent_workers=True,
+            pin_memory=True
+        )
+
+    def train_epoch(self, epoch, train_loader):
+        self.model.train()
+        total_loss = 0
+        progress = tqdm.tqdm(
+            train_loader, 
+            desc=f"Epoch {epoch+1} Train",
+            total=len(train_loader),
+            bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
+        )
+        
+        for i, (a_ids, a_adj, t_ids, t_adj, labels) in enumerate(progress):
+            a_ids, t_ids = a_ids.to(self.device), t_ids.to(self.device)
+            a_adj, t_adj = a_adj.to(self.device), t_adj.to(self.device)
+            labels = labels.to(self.device)
+            
+            with torch.autocast(device_type=self.device, enabled=self.use_amp):
+                outputs = self.model(a_ids, a_adj, t_ids, t_adj)
+                loss = self.criterion(outputs, labels)
+            
+            # Backpropagation
+            self.optimizer.zero_grad()
+            if self.use_amp and self.scaler:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                self.optimizer.step()
+            
+            # Logging
+            total_loss += loss.item()
+            progress.set_postfix(loss=loss.item())
+            
+            if i % self.log_freq == 0 and self.config.use_wandb:
+                wandb.log({
+                    "batch_train_loss": loss.item(),
+                    "lr": self.optim_schedule.get_last_lr()[0]
+                })
+            
+            # Update learning rate
+            self.optim_schedule.step()
+        
+        avg_loss = total_loss / len(train_loader)
+        print(f"Train Loss: {avg_loss:.4f}")
+        return avg_loss
+
+    def validate_epoch(self, epoch, val_loader):
+        self.model.eval()
+        total_loss = 0
+        correct = 0
+        total = 0
+        progress = tqdm.tqdm(
+            val_loader, 
+            desc=f"Epoch {epoch+1} Valid",
+            total=len(val_loader),
+            bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
+        )
+        
+        with torch.no_grad():
+            for i, (a_ids, a_adj, t_ids, t_adj, labels) in enumerate(progress):
+                a_ids, t_ids = a_ids.to(self.device), t_ids.to(self.device)
+                a_adj, t_adj = a_adj.to(self.device), t_adj.to(self.device)
+                labels = labels.to(self.device)
+                
+                outputs = self.model(a_ids, a_adj, t_ids, t_adj)
+                loss = self.criterion(outputs, labels)
+                
+                # Calculate accuracy
+                probs = torch.sigmoid(outputs)
+                predictions = (probs > 0.5).float()
+                correct += (predictions.to(torch.int32) == labels.to(torch.int32)).sum().item()
+                total += labels.size(0)
+                
+                # Logging
+                total_loss += loss.item()
+                accuracy = correct / total if total > 0 else 0
+                progress.set_postfix(loss=loss.item(), accuracy=accuracy)
+        
+        avg_loss = total_loss / len(val_loader)
+        accuracy = correct / total
+        print(f"Val Loss: {avg_loss:.4f}, Val Acc: {accuracy:.4f}")
+        return avg_loss, accuracy

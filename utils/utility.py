@@ -23,7 +23,7 @@ def random_mask(ids, tokenizer: AsmTokenizer):
 
 def tokenize_and_pad(text: list, tokenizer: AsmTokenizer, seq_len: int) -> list:
     """
-    Tokenizes and adds \<CLS\>, \<SEP\>, and padding tokens to a given text.
+    Tokenize and Pad tokens to a given text.
 
     Args:
         tokenizer: The tokenizer to use for encoding.
@@ -34,7 +34,7 @@ def tokenize_and_pad(text: list, tokenizer: AsmTokenizer, seq_len: int) -> list:
         list: A list of token IDs padded to the specified sequence length.
     """
     ids = tokenizer.encode(text)
-    return add_cls_sep_pad(ids, tokenizer, seq_len)
+    return pad_sequence(ids, tokenizer, seq_len, tokenizer.pad_token_id)
 
 
 def add_cls_sep_pad(ids: list, tokenizer: AsmTokenizer, seq_len: int) -> list:
@@ -56,4 +56,20 @@ def add_cls_sep_pad(ids: list, tokenizer: AsmTokenizer, seq_len: int) -> list:
         + ids
         + [tokenizer.sep_token_id]
         + [tokenizer.pad_token_id] * pad_len
+    )
+
+def pad_sequence(ids: list, seq_len: int, pad_id) -> list:
+    """
+    Pad token ids to a given length.
+
+    Args:
+        ids (list): The list of token IDs to modify.
+        seq_len (int): The desired sequence length.
+        pad_id: The padding token ID.
+
+    Returns:
+        list: A list of token IDs with padding added.
+    """
+    pad_len = seq_len - len(ids)
+    return (ids+ [pad_id] * pad_len
     )

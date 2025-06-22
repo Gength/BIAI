@@ -9,6 +9,7 @@ import pickle
 import os
 from scipy.sparse import coo_matrix
 import heapq
+from utils.utility import pad_sequence,random_mask
 class TaskDataset(Dataset):
 	'''Wrap the dataset and add task type information'''
 	def __init__(self, dataset, task_type):
@@ -56,7 +57,7 @@ class FunctionDataset(Dataset):
 
 # Custom dataset class
 class FunctionPairDataset(Dataset):
-	def __init__(self, function_pool_path, dataset_path, function_idx_mapping_path, tokenizer:AsmTokenizer, seq_len=128, max_nodes=300):
+	def __init__(self, function_pool_path, dataset_path, function_idx_mapping_path, tokenizer:AsmTokenizer, seq_len=128, max_nodes=300, train=True):
 		self.df = pd.read_csv(function_pool_path)
 		self.dataset = load_dataset(
 			"json", 
@@ -70,6 +71,7 @@ class FunctionPairDataset(Dataset):
 		self.tokenizer = tokenizer
 		self.seq_len = seq_len
 		self.max_nodes = max_nodes
+		self.train = train  # Flag to indicate if this is a training dataset
 
 	def __len__(self):
 		return len(self.df)
@@ -148,11 +150,25 @@ class FunctionPairDataset(Dataset):
 		# Reconstruct instruction block sequence
 		processed_blocks = []
 		for idx in selected_indices:
-			block = instr_blocks[idx]
-			processed_block = tokenize_and_pad(
-				text=block,
-				tokenizer=self.tokenizer,
-				seq_len=self.seq_len
+			if idx < len(instr_blocks) - 1: # not the last block
+				block = "<CLS> " + instr_blocks[idx] + " <SEP>" + instr_blocks[idx + 1]
+			else: # last block
+				block = "<CLS> " + instr_blocks[idx]
+			ids = self.tokenizer.encode(block)
+			if self.train:
+				# Randomly mask tokens during training
+				processed_block, _ = random_mask(
+					ids=ids,
+					tokenizer=self.tokenizer,
+					seq_len=self.seq_len
+				)
+			else:
+				# Just tokenize and pad during evaluation
+				processed_block = ids
+			processed_block = pad_sequence(
+				ids=processed_block,
+				seq_len=self.seq_len,
+				pad_id=self.tokenizer.pad_token_id
 			)
 			processed_blocks.append(torch.tensor(processed_block))
 		

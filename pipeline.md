@@ -415,13 +415,13 @@ class OrderCNN(nn.Module):
 adjacency matrix is too sparse, the input of model requires dense matrix, directly using converted adjacency matrix will lead to huge gpu memory usage.
 ### Solutions
 + Implement a model which can handle sparse adjacency matrix, not solved yet.
-+ select specific nodes from adjacency matrix, such as the nodes with top-k highest degree (chosen).
++ select specific nodes from adjacency matrix, such as the nodes with top-k highest in- + out-degree (chosen).
 + Use spectral clustering to merge nodes into super-nodes (connectivity becomes 0~1). Note: Spectral clustering may alter graph topology (e.g., merging multiple nodes into a super-node), destroying the original node order (which the paper emphasizes as important). Thus, using spectral clustering may compromise model performance.
 + Remove isolated nodes and compress adjacency matrices to reduce computation. Isolated nodes have no connections; removing them reduces computational complexity but may lose information.
 
 
 # TODO
-+ Remove isolated nodes during dataset preprocessing to compress adjacency matrices and reduce computation
++ Remove **part of** isolated nodes during dataset preprocessing to compress adjacency matrices and reduce computation
 + Implement a model capable of handling sparse adjacency matrices
 + Implement BERT4's tasks:
    - **Block Inside Graph (BIG)**: tries to make the model judge whether two nodes exist on the same graph.
