@@ -44,13 +44,13 @@ if __name__ == "__main__":
         bert_model.load_state_dict(torch.load(config.bert_checkpoint))
         
         # Create semantic-aware model
-        cfgfusion_model = CFGFusionModel(
+        cfg_fusion_model = CFGFusionModel(
             bert_model=bert_model,
             d_model=128,
             hidden_dim=config.hidden_dim,
             device=config.device
         ).to(config.device)
-        return SimilarityClassifier(cfgfusion_model, config.hidden_dim).to(config.device)
+        return SimilarityClassifier(cfg_fusion_model, config.hidden_dim).to(config.device)
     config = Config()
     # Initialize tokenizer to get vocab size
     tokenizer = AsmTokenizer(vocab_file="outputs/baseline-vocab.txt")

@@ -331,9 +331,9 @@ class SparseCFGFusionModel(nn.Module):
         return graph_embedding
 
 class SimilarityClassifier(nn.Module):
-    def __init__(self, semantic_model, graph_hidden_dim=64):
+    def __init__(self, cfg_fusion_model, graph_hidden_dim=64):
         super().__init__()
-        self.semantic_model = semantic_model
+        self.cfg_fusion_model = cfg_fusion_model
         self.classifier = nn.Sequential(
             nn.Linear(2 * graph_hidden_dim, 128),
             nn.ReLU(),
@@ -357,8 +357,8 @@ class SimilarityClassifier(nn.Module):
             Similarity score [batch_size]
         """
         # Get graph embeddings
-        a_embed = self.semantic_model(a_ids, a_adj)
-        t_embed = self.semantic_model(t_ids, t_adj)
+        a_embed = self.cfg_fusion_model(a_ids, a_adj)
+        t_embed = self.cfg_fusion_model(t_ids, t_adj)
         
         # Concatenate embeddings and classify
         combined = torch.cat([a_embed, t_embed], dim=1)

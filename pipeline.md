@@ -239,13 +239,13 @@ adj = {
    2. Update vocabulary for each function's **instruction_blocks**
    3. Save vocabulary
 
-# BERT2 Pretraining
-## BERT2 Model
+# BERT4 Pretraining
+## BERT4 Model
 <div align="center">
-  <img src="./picture/20250621-173701.png" alt="bert2" width="500"/>
+  <img src="./picture/20250621-173701.png" alt="bert2" width="700"/>
 </div>
 
-+ BERT2 Config:
++ BERT4 Config:
   - Vocab Embedding Dim: 128
   - Max Sequence Length: 128
   - Feed-forward/Hidden Dim: 256
@@ -256,74 +256,78 @@ adj = {
 For each epoch, 20% of the dataset is sampled without repetition for training. Once the entire dataset has been sampled, the sampling is reset.
 ## Masked Language Model (MLM) Task
 Masks tokens on the input layer and predicts them on the output layer.
-1. For each function's instruction blocks, perform dynamic sampling to make block pairs:  
-   - Small functions (<30 blocks): use all blocks
-   - Medium functions (30-100 blocks): cover 70% of block pairs
-   - Large functions (>100 blocks): limit the maximum number of pairs to 80 to prevent out of memory
-   - The default is based on **40GB** GPU memory, and the sampling scale is automatically adjusted according to the actual GPU memory
+1. For each function's instruction blocks, randomly sample 50 block pairs as input sequences:  
    - For sampled block pairs, concatenate each block with next block: `<CLS> block1 <SEP> block2` to generate input sequences.
    - For each input sequences, perform random mask while ignoring `<CLS>` and `<SEP>`.  
    - 15% probability of replacement:
      - 80% replaced with `<MASK>`
      - 10% replaced with a random token
      - 10% kept unchanged
-2. Pad with `<PAD>` to the maximum length.
 
-## Adjacency Node Prediction Task
-Extracts all adjacent blocks in a graph and perform above sample strategy in the same graph to predict whether two blocks are adjacent.
+## Adjacency Node Prediction (ANP) Task
 1. Generate positive and negative sample pairs based on the adjacency matrix:
    - Positive sample pairs: Adjacent basic block pairs
    - Negative sample pairs: Randomly selected non-adjacent basic block pairs
-   - imbalanced sampling: set a negative sample ratio of 5:4 to positive samples, i.e., for every 4 positive samples, 5 negative samples are generated.
-2. input: \[cls_id\] + block_A_ids+ \[sep_id\] + block_B_ids, label
+   - balanced sampling: 
+     - For each positive sample, randomly select a negative sample from the same function.
+     - Ensure that the number of positive and negative samples is balanced.
+     - If positive sample is 0, then only negative samples are generated.
+2. input: \[cls_id\] + masked_block_A_ids+ \[sep_id\] + masked_block_B_ids, label
    - cls_id: `<CLS>` token ID
    - sep_id: `<SEP>` token ID
-   - block_A_ids: Tokenize block A and convert to IDs
-   - block_B_ids: Tokenize block B and convert to IDs
+   - masked_block_A_ids: Tokenize block A and convert to IDs, then mask tokens randomly
+   - masked_block_B_ids: Tokenize block B and convert to IDs, then mask tokens randomly
    - label: 1 = adjacent, 0 = not adjacent
+## Block Inside Graph (BIG) Task
+1. Generate positive and negative sample pairs based on the adjacency matrix:
+   - Positive sample pairs: Pairs of blocks that are in the same function (i.e., connected in the CFG).
+   - Negative sample pairs: Randomly selected pairs of blocks from different functions.
+   - balanced sampling: 
+     - For each positive sample, randomly select a negative sample from a different function.
+     - Ensure that the number of positive and negative samples is balanced.
+2. input: \[cls_id\] + masked_block_A_ids+ \[sep_id\] + masked_block_B_ids, label
+   - cls_id: `<CLS>` token ID
+   - sep_id: `<SEP>` token ID
+   - masked_block_A_ids: Tokenize block A and convert to IDs, then mask tokens randomly
+   - masked_block_B_ids: Tokenize block B and convert to IDs, then mask tokens randomly
+   - label: 1 = in same graph, 0 = in different graphs
+
+## Graph Classification (GC) Task
+Platform = \[x86, x64\], Optimization = \[O0, O1, O2, O3, Os\], generate combinations of these two attributes to form a graph classification task.
+```python
+{('O0', 'x86'): 0,
+ ('O0', 'x64'): 1,
+ ('O1', 'x86'): 2,
+ ('O1', 'x64'): 3,
+ ('O2', 'x86'): 4,
+ ('O2', 'x64'): 5,
+ ('O3', 'x86'): 6,
+ ('O3', 'x64'): 7,
+ ('Os', 'x86'): 8,
+ ('Os', 'x64'): 9}
+```
+1. for each function, generate labels based on the mapping above.
+2. in each function, randomly sample 50 blocks as input sequences:
+   - For sampled blocks, add `<CLS>` at the beginning.
+3. input: \[cls_id\] + block_ids, label
+   - cls_id: `<CLS>` token ID
+   - block_ids: Tokenize blocks and convert to IDs
+   - label: Platform and optimization level combination ID
 
 ## Loss Function
-- MLM loss: Uses cross-entropy loss to compute prediction error at masked positions, ignoring `<CLS>` and `<PAD>` tokens.
-- ANP loss: Uses cross-entropy loss to compute prediction error for positive/negative sample pairs.
-- Total loss: MLM loss + Adjacency prediction loss
+- MLM loss: Uses negative log likelihood loss to compute prediction error at masked positions, ignoring `<CLS>` and `<PAD>` tokens.
+- ANP, BIG, GC loss: Uses cross-entropy loss to compute prediction error for positive/negative sample pairs.
+- Total loss: MLM loss + ANP loss + BIG loss + GC loss, with weights set to 1.0 for all tasks.
+
+## TODO
+- in MLM, ANP, BIG Tasks, the context size is 2, which is too small. Need to increase the context size to 3 or more. We should also generate block pairs based on cfg structure, not just adjacent blocks.
+- expand platform to include more architectures (e.g., ARM, MIPS) and compilers (e.g., clang).
 
 # Supervised Function Similarity Learning
 ## Model Structure
 ![](./picture/20250621-005412.png)
-## Supervised Fine-tuning
-1. define a classifier that takes the concatenated embeddings from MPNN + OrderCNN as input and predicts the similarity score between two functions.
-```python
-class SimilarityClassifier(nn.Module):
-    def __init__(self, semantic_model, graph_hidden_dim=64):
-        super().__init__()
-        self.semantic_model = semantic_model
-        self.classifier = nn.Sequential(
-            nn.Linear(2 * graph_hidden_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, a_ids, a_adj, t_ids, t_adj):
-        """
-        a_ids: Input IDs for anchor nodes [batch_size, num_nodes, seq_len]
-        a_adj: Adjacency matrix for anchor nodes [batch_size, num_nodes, num_nodes]
-        t_ids: Input IDs for target nodes [batch_size, num_nodes, seq_len]
-        t_adj: Adjacency matrix for target nodes [batch_size, num_nodes, num_nodes]
-        Output:
-            Similarity score [batch_size] 0~1
-        """
-        # Get graph embeddings
-        a_embed = self.semantic_model(a_ids, a_adj)
-        t_embed = self.semantic_model(t_ids, t_adj)
-        
-        # Concatenate embeddings and classify
-        combined = torch.cat([a_embed, t_embed], dim=1)
-        return self.classifier(combined).squeeze()
-```
 ## Semantic-aware Modeling
-Use pretrained BERT2 to extract semantic-aware representations of assembly instructions.
+Use pretrained BERT4 to extract semantic-aware representations of assembly instructions.
 ## Structural-aware Modeling
 After obtaining the block embeddings from BERT pretraining, we use MPNN to compute the graph semantic & structural embedding of each CFG.
 ```python
@@ -408,21 +412,56 @@ class OrderCNN(nn.Module):
         # Output layer [batch_size, out_features]
         return self.fc_out(x)
 ```
+## Concat & MLP
+```
+block embedding = BERT4.encode(input IDs)
+structure embedding = MPNN(block embedding, adjacency matrix) # 128 dim
+order embedding = OrderCNN(adjacency matrix) # 32 dim
+graph embedding = MLP(concat([structure embedding, order embedding])) # 64 dim
+```
+## Supervised Fine-tuning
+1. define a classifier that takes the concatenated embeddings from MPNN + OrderCNN as input and predicts the similarity score between two functions.
+```python
+class SimilarityClassifier(nn.Module):
+    def __init__(self, cfg_fusion_model, graph_hidden_dim=64):
+        super().__init__()
+        self.cfg_fusion_model = cfg_fusion_model
+        self.classifier = nn.Sequential(
+            nn.Linear(2 * graph_hidden_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, a_ids, a_adj, t_ids, t_adj):
+        """
+        a_ids: Input IDs for anchor nodes [batch_size, num_nodes, seq_len]
+        a_adj: Adjacency matrix for anchor nodes [batch_size, num_nodes, num_nodes]
+        t_ids: Input IDs for target nodes [batch_size, num_nodes, seq_len]
+        t_adj: Adjacency matrix for target nodes [batch_size, num_nodes, num_nodes]
+        Output:
+            Similarity score [batch_size] 0~1
+        """
+        # Get graph embeddings
+        a_embed = self.cfg_fusion_model(a_ids, a_adj)
+        t_embed = self.cfg_fusion_model(t_ids, t_adj)
+        
+        # Concatenate embeddings and classify
+        combined = torch.cat([a_embed, t_embed], dim=1)
+        return self.classifier(combined).squeeze()
+```
 ### Results
 
 
 ## Problems
 adjacency matrix is too sparse, the input of model requires dense matrix, directly using converted adjacency matrix will lead to huge gpu memory usage.
-### Solutions
+### Possible Solutions
 + Implement a model which can handle sparse adjacency matrix, not solved yet.
 + select specific nodes from adjacency matrix, such as the nodes with top-k highest in- + out-degree (chosen).
 + Use spectral clustering to merge nodes into super-nodes (connectivity becomes 0~1). Note: Spectral clustering may alter graph topology (e.g., merging multiple nodes into a super-node), destroying the original node order (which the paper emphasizes as important). Thus, using spectral clustering may compromise model performance.
 + Remove isolated nodes and compress adjacency matrices to reduce computation. Isolated nodes have no connections; removing them reduces computational complexity but may lose information.
 
-
-# TODO
+## TODO
 + Remove **part of** isolated nodes during dataset preprocessing to compress adjacency matrices and reduce computation
 + Implement a model capable of handling sparse adjacency matrices
-+ Implement BERT4's tasks:
-   - **Block Inside Graph (BIG)**: tries to make the model judge whether two nodes exist on the same graph.
-   - **Graph Classification (GC)** makes the model to classify blocks in different platforms, different architectures, or different optimization options.
