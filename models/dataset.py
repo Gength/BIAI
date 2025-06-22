@@ -1,9 +1,7 @@
 import torch
 from torch.utils.data import Dataset
-import random
 import pandas as pd
 import numpy as np
-from scipy.sparse import lil_matrix
 from models.tokenizer import AsmTokenizer
 from utils.utility import tokenize_and_pad
 from datasets import load_dataset
@@ -11,44 +9,6 @@ import pickle
 import os
 from scipy.sparse import coo_matrix
 import heapq
-
-class BERTANPDataset(Dataset):
-	def __init__(self, instr_blocks, tokenizer:AsmTokenizer, adj, max_len=128):
-		self.tokenizer = tokenizer
-		self.adj = lil_matrix(tuple(adj['shape']), dtype=np.int32)
-		self.adj[adj['row'], adj['col']] = adj['data']
-		self.max_len = max_len
-		self.instr_blocks = instr_blocks
-
-		positive_pairs = list(zip(adj['row'], adj['col']))
-		block_ids = np.array([i for i in range(adj['shape'][0])])
-		negative_pairs = []
-		while len(negative_pairs) < len(positive_pairs):
-			i = random.choice(block_ids)
-			j = random.choice(block_ids)
-			if (i, j) not in positive_pairs:
-				negative_pairs.append((i, j))
-		self.pairs = positive_pairs + negative_pairs
-
-	def __len__(self):
-		return len(self.pairs)
-
-	def __getitem__(self, idx):
-		text_a_idx, text_b_idx = self.pairs[idx]
-		text_a = self.instr_blocks[text_a_idx]
-		text_b = self.instr_blocks[text_b_idx]
-		text = "<CLS> " + text_a + " <SEP> " + text_b
-
-		ids = self.tokenizer.encode(text)
-		ids = ids[:self.max_len]  # Truncate to max_len
-		pad_len = self.max_len - len(ids)
-		if pad_len > 0:
-			ids += [self.tokenizer.pad_token_id] * pad_len
-		ids = torch.tensor(ids, dtype=torch.int)
-
-		label = torch.tensor(self.adj[text_a_idx, text_b_idx], dtype=torch.long)
-		return ids, label
-
 class TaskDataset(Dataset):
 	'''Wrap the dataset and add task type information'''
 	def __init__(self, dataset, task_type):
@@ -62,19 +22,50 @@ class TaskDataset(Dataset):
 		item = self.dataset[idx]
 		item["task_type"] = self.task_type
 		return item
-
-# Custom dataset class
-class FunctionPairDataset(Dataset):
-	def __init__(self, csv_path, jsonl_path, mapping_path, tokenizer:AsmTokenizer, seq_len=128, max_nodes=300):
-		self.df = pd.read_csv(csv_path)
+opt = ["O0", "O1", "O2", "O3", "Os"]
+architectures = ["x86", "x64"]
+opt_arch_combinations = [(o, arch) for o in opt for arch in architectures]
+opt_arch_mapping = {(o, arch): i for i, (o, arch) in enumerate(opt_arch_combinations)}
+class FunctionDataset(Dataset):
+	def __init__(self, dataset_path, function_idx_mapping_path, tokenizer:AsmTokenizer, max_len=128):
+		self.tokenizer = tokenizer
 		self.dataset = load_dataset(
 			"json", 
-			data_files=jsonl_path,
+			data_files=dataset_path,
 			split="train",
 			cache_dir=os.path.join(".", "outputs", "cache"),
 			keep_in_memory=False
 		)
-		with open(mapping_path, "rb") as f:
+		with open(function_idx_mapping_path, "rb") as f:
+			self.function_idx_mapping_path = pickle.load(f)
+		self.idx_function_mapping = {v: k for k, v in self.function_idx_mapping_path.items()}
+		self.max_len = max_len
+
+
+	def __len__(self):
+		return len(self.dataset)
+
+	def __getitem__(self, idx):
+		data = self.dataset[idx]
+		function_name, compiler, version, opt, file_name = self.idx_function_mapping[idx]
+		architecture = file_name.split("-")[0]  # Extract architecture from file name
+		key =(opt, architecture)
+		data["opt_arch_idx"] = opt_arch_mapping[key]
+		
+		return data
+
+# Custom dataset class
+class FunctionPairDataset(Dataset):
+	def __init__(self, function_pool_path, dataset_path, function_idx_mapping_path, tokenizer:AsmTokenizer, seq_len=128, max_nodes=300):
+		self.df = pd.read_csv(function_pool_path)
+		self.dataset = load_dataset(
+			"json", 
+			data_files=dataset_path,
+			split="train",
+			cache_dir=os.path.join(".", "outputs", "cache"),
+			keep_in_memory=False
+		)
+		with open(function_idx_mapping_path, "rb") as f:
 			self.mapping = pickle.load(f)
 		self.tokenizer = tokenizer
 		self.seq_len = seq_len

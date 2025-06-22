@@ -382,22 +382,20 @@ class BIGHead(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             # Binary classification: same graph / different graph
             nn.Linear(hidden_dim, 2)  
         )
 
-    def forward(self, vec_a, vec_b):
+    def forward(self, vec):
         """
         Inputs:
-            vec_a: block embedding [batch_size, d_model]
-            vec_b: block embedding [batch_size, d_model]
+            vec: block embedding [batch_size, d_model]
         Output: 
             same-graph logits [batch_size, 2]
         """
-        x = torch.cat([vec_a, vec_b], dim=1)
-        return self.classifier(x)
+        return self.classifier(vec)
 
 class GraphClassificationHead(nn.Module):
     def __init__(self, hidden_dim, num_classes):
@@ -441,8 +439,7 @@ class BERT4(BERT2):
             return super().forward(input_dict)
         elif task_type == 'big':
             return self.forward_big(
-                input_dict['input_a'], 
-                input_dict['input_b'], 
+                input_dict['input_ids'], 
                 input_dict['labels']
             )
         elif task_type == 'gc':
@@ -453,7 +450,7 @@ class BERT4(BERT2):
         else:
             raise ValueError(f"Unknown Task Type: {task_type}")
 
-    def forward_big(self, input_a, input_b, labels):
+    def forward_big(self, input_ids, labels):
         """
         Inputs (assumed to be on correct device):
             input_a: block A tokens [batch_size, seq_len]
@@ -462,9 +459,8 @@ class BERT4(BERT2):
         Output: 
             (loss, logits) where logits [batch_size, 2]
         """
-        vec_a = self.encode(input_a)
-        vec_b = self.encode(input_b)
-        logits = self.big_head(vec_a, vec_b)
+        vec = self.encode(input_ids)
+        logits = self.big_head(vec)
         loss = F.cross_entropy(logits, labels)
         return loss, logits
 

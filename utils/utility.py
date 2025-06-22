@@ -1,5 +1,25 @@
 from models.tokenizer import AsmTokenizer
-
+import random
+def random_mask(ids, tokenizer: AsmTokenizer):
+    output = []
+    labels = []
+    for token_id in ids:
+        if token_id == tokenizer.sep_token_id or token_id == tokenizer.cls_token_id:
+            output.append(token_id)
+            labels.append(0)
+        elif random.random() < 0.15:
+            rand_val = random.random()
+            if rand_val < 0.8:
+                output.append(tokenizer.mask_token_id)  # 80% replaced with MASK
+            elif rand_val < 0.9:
+                output.append(random.choice(list(tokenizer.vocab.values())))  # 10% random token
+            else:
+                output.append(token_id)  # 10% keep original
+            labels.append(token_id)
+        else:
+            output.append(token_id)
+            labels.append(0)
+    return output, labels
 
 def tokenize_and_pad(text: list, tokenizer: AsmTokenizer, seq_len: int) -> list:
     """

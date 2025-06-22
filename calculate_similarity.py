@@ -19,14 +19,14 @@ if __name__ == "__main__":
     tokenizer = AsmTokenizer(
         vocab_file=os.path.join(data_dir, "outputs", f"baseline-vocab.txt")
     )
-    csv_path = os.path.join(data_dir, "outputs", "test-function_pool.csv")
+    function_pool_path = os.path.join(data_dir, "outputs", "test-function_pool.csv")
     cache_dir = os.path.join(data_dir, "outputs", "cache")
     os.makedirs(cache_dir, exist_ok=True)
     # Create datasets
     test_dataset = FunctionPairDataset(
-        csv_path=csv_path,
-        jsonl_path=os.path.join(data_dir, "outputs", "baseline-test.jsonl"),
-        mapping_path=os.path.join(data_dir, "outputs", "test-function-idx-mapping.pkl"),
+        function_pool_path=function_pool_path,
+        dataset_path=os.path.join(data_dir, "outputs", "baseline-test.jsonl"),
+        function_idx_mapping_path=os.path.join(data_dir, "outputs", "test-function-idx-mapping.pkl"),
         tokenizer=tokenizer,
         seq_len=128,
         max_blocks=50

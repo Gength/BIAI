@@ -35,7 +35,7 @@ class Config:
 config = Config()
 
 
-class BERT2FinetuneTrainer:
+class BERTFinetuneTrainer:
     def __init__(
         self,
         model,
@@ -345,18 +345,18 @@ if __name__ == "__main__":
     
     # Create datasets
     train_dataset = FunctionPairDataset(
-        csv_path=os.path.join("outputs", "train-function_pool.csv"),
-        jsonl_path=os.path.join("outputs", "baseline-train.jsonl"),
-        mapping_path=os.path.join("outputs", "train-function-idx-mapping.pkl"),
+        function_pool_path=os.path.join("outputs", "train-function_pool.csv"),
+        dataset_path=os.path.join("outputs", "baseline-train.jsonl"),
+        function_idx_mapping_path=os.path.join("outputs", "train-function-idx-mapping.pkl"),
         tokenizer=tokenizer,
         seq_len=config.seq_len,
         max_nodes=config.max_nodes
     )
     
     val_dataset = FunctionPairDataset(
-        csv_path=os.path.join("outputs", "val-function_pool.csv"),
-        jsonl_path=os.path.join("outputs", "baseline-val.jsonl"),
-        mapping_path=os.path.join("outputs", "val-function-idx-mapping.pkl"),
+        function_pool_path=os.path.join("outputs", "val-function_pool.csv"),
+        dataset_path=os.path.join("outputs", "baseline-val.jsonl"),
+        function_idx_mapping_path=os.path.join("outputs", "val-function-idx-mapping.pkl"),
         tokenizer=tokenizer,
         seq_len=config.seq_len,
         max_nodes=config.max_nodes
@@ -364,7 +364,7 @@ if __name__ == "__main__":
     
     # Initialize model and trainer
     model = init_model(vocab_size)
-    trainer = BERT2FinetuneTrainer(
+    trainer = BERTFinetuneTrainer(
         model=model,
         train_dataset=train_dataset,  # Pass full training dataset
         val_dataset=val_dataset,      # Pass full validation dataset
