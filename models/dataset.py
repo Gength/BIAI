@@ -150,23 +150,10 @@ class FunctionPairDataset(Dataset):
 		# Reconstruct instruction block sequence
 		processed_blocks = []
 		for idx in selected_indices:
-			if idx < len(instr_blocks) - 1: # not the last block
-				block = "<CLS> " + instr_blocks[idx] + " <SEP>" + instr_blocks[idx + 1]
-			else: # last block
-				block = "<CLS> " + instr_blocks[idx]
+			block = "<CLS> " + instr_blocks[idx]
 			ids = self.tokenizer.encode(block)
-			if self.train:
-				# Randomly mask tokens during training
-				processed_block, _ = random_mask(
-					ids=ids,
-					tokenizer=self.tokenizer,
-					seq_len=self.seq_len
-				)
-			else:
-				# Just tokenize and pad during evaluation
-				processed_block = ids
 			processed_block = pad_sequence(
-				ids=processed_block,
+				ids=ids,
 				seq_len=self.seq_len,
 				pad_id=self.tokenizer.pad_token_id
 			)

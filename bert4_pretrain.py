@@ -8,15 +8,14 @@ from models.dataset import opt_arch_combinations
 
 class Config:
     batch_size = 10
-    epochs = 12
+    epochs = 15
     log_freq = 10
     seq_len = 128    # Maximum sequence length
     lr = 1e-5
     weight_decay=0.01
     betas=(0.9, 0.999)
-    epochs = 40
     device = "cuda"
-    checkpoint_save_path = os.path.join("outputs", "bert-pretrain")
+    checkpoint_save_path = os.path.join("outputs", "bert4-pretrain")
     use_amp = True  # Use Automatic Mixed Precision (AMP) if available
     use_wandb = True  # Use Weights & Biases for logging
     wandb_run = "bert4-pretrain"  # Weights & Biases run name
@@ -32,7 +31,6 @@ class dummy_context:
         pass
 
 if __name__ == "__main__":
-    gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
     config = Config()
     tokenizer = AsmTokenizer(
         vocab_file=os.path.join("outputs", f"baseline-vocab.txt")

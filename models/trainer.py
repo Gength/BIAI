@@ -48,6 +48,11 @@ class BERT2PretrainTrainer:
         total_steps = steps_per_epoch * config.epochs
         
         # Single learning rate scheduler
+        # self.optim_schedule = torch.optim.lr_scheduler.CosineAnnealingLR(
+        #     self.optim,
+        #     T_max=total_steps,
+        #     eta_min=1e-6  # minimum learning rate
+        # )
         self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
             self.optim,
             max_lr=1e-3,
@@ -277,6 +282,8 @@ class BERT2PretrainTrainer:
             if i % self.log_freq == 0:
                 wandb.log({
                     "batch": epoch * max_batches + i,
+                    "mlm_loss": mlm_loss.item(),
+                    "anp_loss": anp_loss.item(),
                     "batch_train_loss": total_batch_loss.item(),
                     "batch_avg_train_loss": avg_loss,
                     "lr": self.optim_schedule.get_last_lr()[0]

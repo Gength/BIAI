@@ -5,7 +5,7 @@ from utils.utility import random_mask, pad_sequence
 from scipy.sparse import lil_matrix
 import numpy as np
 class MLMCollateFn:
-    def __init__(self, tokenizer: AsmTokenizer, seq_len=128, train=True, max_samples=50):
+    def __init__(self, tokenizer: AsmTokenizer, seq_len=128, max_samples=40, train=True):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.train = train
@@ -55,7 +55,7 @@ class MLMCollateFn:
         }
 
 class ANPCollateFn:
-    def __init__(self, tokenizer, seq_len=128, max_samples=50, train=True):
+    def __init__(self, tokenizer, seq_len=128, max_samples=40, train=True):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.max_samples = max_samples
@@ -159,7 +159,7 @@ class ANPCollateFn:
         }
 
 class BIGCollateFn:
-    def __init__(self, tokenizer, seq_len=128, max_samples=50, train=True):
+    def __init__(self, tokenizer, seq_len=128, max_samples=40, train=True):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.max_samples = max_samples
@@ -263,7 +263,7 @@ class BIGCollateFn:
         }
 
 class GCCollateFn:
-    def __init__(self, tokenizer, seq_len=128, max_samples=50):
+    def __init__(self, tokenizer, seq_len=128, max_samples=40):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.max_samples = max_samples
