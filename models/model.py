@@ -2,140 +2,114 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 class MPNNLayer(nn.Module):
-    def __init__(self, in_dim, hidden_dim):
+    """Single layer of Message Passing Neural Network (MPNN)
+    
+    Implements message passing and node update operations using:
+    - Message function: MLP with ReLU activation
+    - Update function: GRUCell for state transition
+    
+    Args:
+        in_dim (int): Dimension of input node features (default: 128)
+        hidden_dim (int): Dimension of hidden states (default: 128)
+    """
+    def __init__(self, in_dim=128, hidden_dim=128):
         super().__init__()
+        # Message function: MLP that transforms neighbor features
         self.message_func = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU()
         )
+        # Update function: GRU cell for node state transition
         self.update_func = nn.GRUCell(hidden_dim, in_dim)
 
     def forward(self, h, adj):
         """
+        Perform one step of message passing and node update
+        
         Inputs:
-            h: node features [batch_size, num_nodes, in_dim]
-            adj: adjacency matrix [batch_size, num_nodes, num_nodes]
+            h: Node features 
+                shape [batch_size, num_nodes, in_dim]
+            adj: Adjacency matrix (binary or weighted)
+                shape [batch_size, num_nodes, num_nodes]
+                
         Output: 
-            updated node features [batch_size, num_nodes, in_dim]
+            Updated node features
+                shape [batch_size, num_nodes, in_dim]
         """
         # Message aggregation: m_v = Σ_{w∈N(v)} MLP(h_w)
-        m = torch.matmul(adj, self.message_func(h))
-        # Update node features: h_v = GRU(h_v, m_v)
-        batch_size, num_nodes, _ = h.shape
-        h_flat = h.reshape(-1, h.size(-1))
-        m_flat = m.reshape(-1, m.size(-1))
+        # matmul(adj, message_func(h)) performs neighborhood sum
+        m = torch.matmul(adj, self.message_func(h))  # [batch, node, hidden]
+        
+        # Reshape for GRUCell: flatten batch and node dimensions
+        batch_size, num_nodes, in_dim = h.shape
+        h_flat = h.reshape(-1, in_dim)              # [batch*node, in_dim]
+        m_flat = m.reshape(-1, m.size(-1))           # [batch*node, hidden]
+        
+        # Update node states: h_v^{t+1} = GRU(h_v^t, m_v)
         updated_flat = self.update_func(m_flat, h_flat)
-        return updated_flat.reshape(batch_size, num_nodes, -1)
+        
+        # Restore original shape
+        return updated_flat.view(batch_size, num_nodes, in_dim)
+
 
 class MPNN(nn.Module):
-    def __init__(self, in_dim, hidden_dim, n_steps=5):
+    """Full MPNN model with multiple message passing steps
+    
+    Implements:
+    - T-step message passing
+    - Node-level readout with initial & final features
+    - Graph embedding via node summation
+    
+    Args:
+        in_dim (int): Input node feature dimension (default: 128)
+        hidden_dim (int): Hidden state dimension (default: 128)
+        n_steps (int): Number of message passing steps (default: 5)
+        readout_dim (int): Output graph embedding dimension (default: 64)
+    """
+    def __init__(self, in_dim=128, hidden_dim=128, n_steps=5, readout_dim=64):
         super().__init__()
         self.n_steps = n_steps
         self.mpnn_layer = MPNNLayer(in_dim, hidden_dim)
-        self.readout = nn.Sequential(
-            nn.Linear(in_dim * 2, hidden_dim),
+        
+        # Node-level MLP for readout: processes [h_v^0, h_v^T] per node
+        self.node_mlp = nn.Sequential(
+            nn.Linear(in_dim * 2, readout_dim),
             nn.ReLU()
         )
 
     def forward(self, h0, adj):
         """
+        Generate graph embedding from initial node features and adjacency
+        
         Inputs:
-            h0: initial node features [batch_size, num_nodes, in_dim]
-            adj: adjacency matrix [batch_size, num_nodes, num_nodes]
+            h0: Initial node features 
+                shape [batch_size, num_nodes, in_dim]
+            adj: Adjacency matrix 
+                shape [batch_size, num_nodes, num_nodes]
+                
         Output: 
-            graph embedding [batch_size, hidden_dim]
+            Graph embedding vector
+                shape [batch_size, readout_dim]
         """
         h = h0
         # Run T steps of message passing
         for _ in range(self.n_steps):
             h = self.mpnn_layer(h, adj)
         
-        # Read out features at step 0 and step T and concatenate
-        h0_sum = torch.sum(h0, dim=1)  # [batch_size, in_dim]
-        hT_sum = torch.sum(h, dim=1)   # [batch_size, in_dim]
-        combined = torch.cat([h0_sum, hT_sum], dim=1)
+        # Node-level feature fusion: concatenate initial and final states
+        # combined_per_node shape: [batch_size, num_nodes, in_dim*2]
+        combined_per_node = torch.cat([h0, h], dim=-1)
         
-        # Generate graph embedding
-        return self.readout(combined)
+        # Transform each node's combined features
+        # node_embeddings shape: [batch_size, num_nodes, readout_dim]
+        node_embeddings = self.node_mlp(combined_per_node)
+        
+        # Generate graph embedding: sum over all nodes
+        # graph_embedding shape: [batch_size, readout_dim]
+        graph_embedding = torch.sum(node_embeddings, dim=1)
+        
+        return graph_embedding
 
-class SparseMPNNLayer(nn.Module):
-    def __init__(self, in_dim, hidden_dim):
-        super().__init__()
-        self.message_func = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU()
-        )
-        self.update_func = nn.GRUCell(hidden_dim, in_dim)
-
-    def forward(self, h, adj_indices_list, adj_values_list, adj_size):
-        """
-        Inputs:
-            h: node features [batch_size, num_nodes, in_dim]
-            adj_indices_list: adjacency matrix indices list [batch_size, [2, num_edges]]
-            adj_values_list: adjacency matrix values list [batch_size, [num_edges]]
-            adj_size: adjacency matrix size [num_nodes, num_nodes]
-        Output: 
-            updated node features [batch_size, num_nodes, in_dim]
-        """
-        batch_size, num_nodes, _ = h.shape
-        
-        # Create batch sparse tensor
-        batch_indices = []
-        batch_values = []
-        for i in range(batch_size):
-            # Get indices and values for current graph
-            graph_indices = adj_indices_list[i]
-            graph_values = adj_values_list[i]
-            
-            # Add batch dimension to indices
-            offset = i * num_nodes
-            indices = graph_indices.clone()
-            indices[0] += offset
-            indices[1] += offset
-            batch_indices.append(indices)
-            batch_values.append(graph_values)
-        
-        # Merge all indices and values
-        batch_indices = torch.cat(batch_indices, dim=1)
-        batch_values = torch.cat(batch_values)
-        
-        # Create batch sparse adjacency matrix
-        sparse_adj = torch.sparse_coo_tensor(
-            batch_indices, 
-            batch_values,
-            size=(batch_size * num_nodes, batch_size * num_nodes)
-        )
-        
-        # Message passing: m = A * MLP(h)
-        mlp_h = self.message_func(h.view(-1, h.size(-1)))  # [batch*num_nodes, hidden]
-        m = torch.sparse.mm(sparse_adj, mlp_h)  # [batch*num_nodes, hidden]
-        m = m.view(batch_size, num_nodes, -1)    # [batch, num_nodes, hidden]
-        
-        # Update node features
-        h_flat = h.view(-1, h.size(-1))  # [batch*num_nodes, in_dim]
-        m_flat = m.view(-1, m.size(-1))  # [batch*num_nodes, hidden]
-        updated_flat = self.update_func(m_flat, h_flat)
-        return updated_flat.view(batch_size, num_nodes, -1)
-
-class SparseMPNN(nn.Module):
-    def __init__(self, in_dim, hidden_dim, n_steps=5):
-        super().__init__()
-        self.n_steps = n_steps
-        self.mpnn_layer = SparseMPNNLayer(in_dim, hidden_dim)
-        self.readout = nn.Sequential(
-            nn.Linear(in_dim * 2, hidden_dim),
-            nn.ReLU()
-        )
-
-    def forward(self, h0, adj_indices, adj_values, adj_size):
-        h = h0
-        for _ in range(self.n_steps):
-            h = self.mpnn_layer(h, adj_indices, adj_values, adj_size)
-        
-        h0_sum = torch.sum(h0, dim=1)  # [batch_size, in_dim]
-        hT_sum = torch.sum(h, dim=1)   # [batch_size, in_dim]
-        combined = torch.cat([h0_sum, hT_sum], dim=1)
-        return self.readout(combined)
 
 class ResNetBlock(nn.Module):
     def __init__(self, channels):
@@ -209,10 +183,12 @@ class CFGFusionModel(nn.Module):
     2. Structure-aware modeling (MPNN)
     3. Order-aware modeling (OrderCNN)
     """
-    def __init__(self, bert_model, d_model=128, hidden_dim=64, device="cuda"):
+    def __init__(self, bert_model, d_model=128, mpnn_readout_dim=64, cnn_out=32, hidden_dim=64, device="cuda"):
         """
         :param bert_model: Pretrained BERT model
         :param d_model: Output embedding dimension of BERT
+        :param mpnn_readout_dim: Output dimension of MPNN readout
+        :param cnn_out: Output dimension of OrderCNN
         :param hidden_dim: Final graph embedding dimension
         :param device: Computing device
         """
@@ -221,14 +197,15 @@ class CFGFusionModel(nn.Module):
         self.bert = bert_model
         
         # Structure-aware modeling component
-        self.mpnn = MPNN(in_dim=d_model, hidden_dim=d_model, n_steps=5)
+        self.mpnn = MPNN(in_dim=d_model, hidden_dim=d_model, n_steps=5, readout_dim=mpnn_readout_dim)
         
         # Order-aware modeling component
-        self.order_cnn = OrderCNN(in_channels=1, num_blocks=3)
+        self.order_cnn = OrderCNN(in_channels=1, num_blocks=3, out_features=cnn_out)
         
         # Fusion layer
+        fusion_in = mpnn_readout_dim + cnn_out
         self.fusion = nn.Sequential(
-            nn.Linear(d_model + 32, hidden_dim),  # 32 is the output dimension of OrderCNN
+            nn.Linear(fusion_in, hidden_dim),
             nn.ReLU()
         )
     
@@ -269,110 +246,3 @@ class CFGFusionModel(nn.Module):
         graph_embedding = self.fusion(combined)
         
         return graph_embedding
-
-class SparseCFGFusionModel(nn.Module):
-    def __init__(self, bert_model, d_model=128, hidden_dim=64, device="cuda"):
-        super().__init__()
-        self.device = device
-        self.bert = bert_model
-        self.mpnn = SparseMPNN(in_dim=d_model, hidden_dim=d_model, n_steps=5)
-        self.order_cnn = OrderCNN(in_channels=1, num_blocks=3)
-        self.fusion = nn.Sequential(
-            nn.Linear(d_model + 32, hidden_dim),
-            nn.ReLU()
-        )
-    
-    def forward(self, input_ids, adj_indices_list, adj_values_list):
-        """
-        Inputs:
-            input_ids: token sequences [batch_size, num_nodes, seq_len]
-            adj_indices_list: adjacency matrix indices list [batch_size, [2, num_edges]]
-            adj_values_list: adjacency matrix values list [batch_size, [num_edges]]
-        """
-        batch_size, num_nodes, seq_len = input_ids.shape
-        
-        # Semantic modeling
-        flat_input_ids = input_ids.view(batch_size * num_nodes, seq_len)
-        block_embeddings = self.bert.encode(flat_input_ids)
-        node_features = block_embeddings.view(batch_size, num_nodes, -1)
-        
-        # Structure modeling (using sparse matrix)
-        structure_embedding = self.mpnn(
-            node_features, 
-            adj_indices_list, 
-            adj_values_list, 
-            (num_nodes, num_nodes)
-        )
-        
-        # Order modeling (requires dense matrix)
-        order_embeddings = []
-        for i in range(batch_size):
-            if len(adj_indices_list[i]) > 0:  # If there are edges
-                adj_dense = torch.sparse_coo_tensor(
-                    adj_indices_list[i], 
-                    adj_values_list[i], 
-                    size=(num_nodes, num_nodes)
-                ).to_dense()
-            else:
-                adj_dense = torch.zeros(num_nodes, num_nodes, device=self.device)
-            
-            # Add batch dimension [1, num_nodes, num_nodes]
-            adj_dense = adj_dense.unsqueeze(0)
-            order_emb = self.order_cnn(adj_dense)
-            order_embeddings.append(order_emb)
-        
-        # Stack batch results
-        order_embedding = torch.cat(order_embeddings, dim=0)
-        
-        # Fusion
-        combined = torch.cat([structure_embedding, order_embedding], dim=-1)
-        graph_embedding = self.fusion(combined)
-        
-        return graph_embedding
-
-class SimilarityClassifier(nn.Module):
-    def __init__(self, cfg_fusion_model, graph_hidden_dim=64):
-        super().__init__()
-        self.cfg_fusion_model = cfg_fusion_model
-        self.classifier = nn.Sequential(
-            nn.Linear(2 * graph_hidden_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 1),
-            # nn.Sigmoid()
-        )
-        # RuntimeError: torch.nn.functional.binary_cross_entropy and torch.nn.BCELoss are unsafe to autocast.
-        # Many models use a sigmoid layer right before the binary cross entropy layer.
-        # In this case, combine the two layers using torch.nn.functional.binary_cross_entropy_with_logits
-        # or torch.nn.BCEWithLogitsLoss.  binary_cross_entropy_with_logits and BCEWithLogits are
-        # safe to autocast.
-
-    def forward(self, a_ids, a_adj, t_ids, t_adj):
-        """
-        a_ids: Input IDs for anchor nodes [batch_size, num_nodes, seq_len]
-        a_adj: Adjacency matrix for anchor nodes [batch_size, num_nodes, num_nodes]
-        t_ids: Input IDs for target nodes [batch_size, num_nodes, seq_len]
-        t_adj: Adjacency matrix for target nodes [batch_size, num_nodes, num_nodes]
-        Output:
-            Similarity score [batch_size]
-        """
-        # Get graph embeddings
-        a_embed = self.cfg_fusion_model(a_ids, a_adj)
-        t_embed = self.cfg_fusion_model(t_ids, t_adj)
-        
-        # Concatenate embeddings and classify
-        combined = torch.cat([a_embed, t_embed], dim=1)
-        return self.classifier(combined).squeeze()
-
-class SparseSimilarityClassifier(SimilarityClassifier):
-   def forward(self, a_ids, a_adj_indices, a_adj_values, t_ids, t_adj_indices, t_adj_values):
-        """
-        Modified forward pass, accepts sparse adjacency matrix parameters
-        """
-        # Get graph embeddings
-        a_embed = self.semantic_model(a_ids, a_adj_indices, a_adj_values)
-        t_embed = self.semantic_model(t_ids, t_adj_indices, t_adj_values)
-        
-        # Concatenate embeddings and classify
-        combined = torch.cat([a_embed, t_embed], dim=1)
-        return self.classifier(combined).squeeze()

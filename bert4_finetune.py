@@ -1,7 +1,7 @@
 import torch
 import os
 from models.bert import BERT4
-from models.model import CFGFusionModel, SimilarityClassifier
+from models.model import CFGFusionModel
 from models.tokenizer import AsmTokenizer
 from models.dataset import FunctionPairDataset
 from models.trainer import BERTFinetuneTrainer
@@ -9,22 +9,22 @@ from models.dataset import opt_arch_combinations
 
 # Configuration parameters with sampling ratios
 class Config:
-    batch_size = 6  # A40: 7
+    batch_size = 7  # A40: 7
     max_nodes = 200  # Maximum number of basic blocks
     seq_len = 128    # Maximum sequence length
     hidden_dim = 64  # Graph embedding dimension
     lr = 1e-4
     betas = (0.9, 0.999)
     weight_decay = 0.01
-    epochs = 12
+    epochs = 10
     device = "cuda"
-    bert_checkpoint = os.path.join("outputs", "bert-pretrain", "bert4"
+    bert_checkpoint = os.path.join("outputs", "bert4-pretrain", "bert4"
     "-best.pth")  # Pretrained BERT path
-    checkpoint_save_path = os.path.join("outputs", "bert-finetune")  # Checkpoint save path
+    checkpoint_save_path = os.path.join("outputs", "bert4-finetune")  # Checkpoint save path
     use_amp = True  # Use Automatic Mixed Precision (AMP) if available
     use_wandb = True  # Use Weights & Biases for logging
-    wandb_run = "bert2-finetune"  # Weights & Biases run name
-    wandb_project = "bert2-training"  # Weights & Biases project name
+    wandb_run = "bert4-finetune"  # Weights & Biases run name
+    wandb_project = "bert4-training"  # Weights & Biases project name
     log_freq = 10  
     train_sample_ratio = 0.2  # 20% training set sampling ratio
     val_sample_ratio = 0.2    # 20% validation set sampling ratio
@@ -50,7 +50,7 @@ if __name__ == "__main__":
             hidden_dim=config.hidden_dim,
             device=config.device
         ).to(config.device)
-        return SimilarityClassifier(cfg_fusion_model, config.hidden_dim).to(config.device)
+        return cfg_fusion_model
     config = Config()
     # Initialize tokenizer to get vocab size
     tokenizer = AsmTokenizer(vocab_file="outputs/baseline-vocab.txt")

@@ -11,6 +11,8 @@ import wandb
 import tqdm
 from models.dataset import TaskDataset
 from torch.utils.data import Subset
+import torch.nn.functional as F
+from models.model import CFGFusionModel
 
 class BERT2PretrainTrainer:
     def __init__(
@@ -103,7 +105,9 @@ class BERT2PretrainTrainer:
             config.seq_len
             )
         self.combined_collate = CombinedCollateFn(self.mlm_collate, self.anp_collate)
-        
+    def create_subset(self, dataset, indices):
+        """Create dataset subset (compatible with custom datasets)"""
+        return Subset(dataset, indices) 
     def create_dataloader(self, dataset, batch_size, shuffle=True):
         """Create DataLoader"""
         return DataLoader(
@@ -162,7 +166,7 @@ class BERT2PretrainTrainer:
                 self.config.train_sample_ratio,
                 "training"
             )
-            train_subset = self.full_train_dataset.select(train_indices)
+            train_subset = self.create_subset(self.full_train_dataset, train_indices)
             
             # Create task-specific datasets
             mlm_train_dataset = TaskDataset(train_subset, "mlm")
@@ -181,7 +185,7 @@ class BERT2PretrainTrainer:
                 self.config.val_sample_ratio,
                 "validation"
             )
-            valid_subset = self.full_valid_dataset.select(valid_indices)
+            valid_subset = self.create_subset(self.full_valid_dataset, valid_indices)
             
             # Create task-specific datasets
             mlm_valid_dataset = TaskDataset(valid_subset, "mlm")
@@ -340,6 +344,7 @@ class BERT2PretrainTrainer:
         task_dict = {"task_type": task_type}
         task_dict.update({
             'input_ids': data["input_ids"].to(self.device),
+            'segment_ids': data.get("segment_ids", None).to(self.device) if "segment_ids" in data else None,
             'labels': data["labels"].to(self.device)
         })        
         return task_dict
@@ -354,7 +359,6 @@ class BERT4PretrainTrainer(BERT2PretrainTrainer):
         config
     ):
         super().__init__(model, train_dataset, valid_dataset, tokenizer, config)
-        
         # Add collate functions for new tasks
         self.big_collate = BIGCollateFn(
             tokenizer, 
@@ -372,7 +376,32 @@ class BERT4PretrainTrainer(BERT2PretrainTrainer):
             self.big_collate,
             self.gc_collate
         )
-    
+        # 重新计算总步数（每个batch两次更新）
+        train_samples_per_epoch = int(len(train_dataset) * config.train_sample_ratio)
+        steps_per_epoch = math.ceil(train_samples_per_epoch / config.batch_size)
+        total_steps = 2 * steps_per_epoch * config.epochs  # 乘以2因为每个batch两次更新
+        
+        # 重新初始化学习率调度器
+        self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
+            self.optim,
+            max_lr=1e-3,
+            total_steps=total_steps,
+            pct_start=0.3,
+            anneal_strategy="cos",
+            final_div_factor=1e2,
+        )
+        self.loss_weights = {
+            "mlm": 1.0,
+            "anp": 1.0,
+            "big": 1.0,
+            "gc": 1.0
+        }
+        wandb.config.update({
+            "mlm_loss_weight": self.loss_weights["mlm"],
+            "anp_loss_weight": self.loss_weights["anp"],
+            "big_loss_weight": self.loss_weights["big"],
+            "gc_loss_weight": self.loss_weights["gc"]
+        })
     def create_dataloader(self, dataset, batch_size, shuffle=True):
         """Create DataLoader (override parent method)"""
         return DataLoader(
@@ -385,10 +414,6 @@ class BERT4PretrainTrainer(BERT2PretrainTrainer):
             collate_fn=self.combined_collate,
             shuffle=shuffle
         )
-    
-    def create_subset(self, dataset, indices):
-        """Create dataset subset (compatible with custom datasets)"""
-        return Subset(dataset, indices)
     
     def train(self):
         for epoch in range(self.epochs):
@@ -483,118 +508,149 @@ class BERT4PretrainTrainer(BERT2PretrainTrainer):
         self.model.train()
         total_loss = 0.0
         total_batches = 0
-        
+
         # Create iterators
         mlm_iter = iter(mlm_train_loader)
         anp_iter = iter(anp_train_loader)
         big_iter = iter(big_train_loader)
         gc_iter = iter(gc_train_loader)
-        
-        # Determine max number of batches
+
+        # Determine the maximum number of batches
         max_batches = max(
-            len(mlm_train_loader), 
+            len(mlm_train_loader),
             len(anp_train_loader),
             len(big_train_loader),
             len(gc_train_loader)
         )
-        
+
         data_iter = tqdm.tqdm(
             range(max_batches),
             desc=f"Epoch {epoch+1} Train",
             total=max_batches,
             bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
         )
-        
+
+        # Check whether to freeze MLM gradients
+        freeze_mlm = epoch > self.epochs // 2
+
         for i in data_iter:
+            # ====================== Phase 1: MLM, ANP, BIG tasks ======================
             task_losses = []
-            
+            mlm_loss = anp_loss = big_loss = gc_loss = 0
+
             # Handle MLM task
             try:
                 mlm_batch = next(mlm_iter)
                 mlm_task_dict = self.prepare_task_dict(mlm_batch)
-                mlm_loss, _ = self.model(mlm_task_dict)
-                task_losses.append(mlm_loss)
+
+                if freeze_mlm:
+                    # Freeze MLM gradients
+                    with torch.no_grad():
+                        mlm_loss, _ = self.model(mlm_task_dict)
+                else:
+                    # Train MLM normally
+                    mlm_loss, _ = self.model(mlm_task_dict)
+
+                task_losses.append(mlm_loss * self.loss_weights["mlm"])
             except StopIteration:
                 pass
-            
+
             # Handle ANP task
             try:
                 anp_batch = next(anp_iter)
                 anp_task_dict = self.prepare_task_dict(anp_batch)
                 anp_loss, _ = self.model(anp_task_dict)
-                task_losses.append(anp_loss)
+                task_losses.append(anp_loss * self.loss_weights["anp"])
             except StopIteration:
                 pass
-            
+
             # Handle BIG task
             try:
                 big_batch = next(big_iter)
                 big_task_dict = self.prepare_task_dict(big_batch)
                 big_loss, _ = self.model(big_task_dict)
-                task_losses.append(big_loss)
+                task_losses.append(big_loss * self.loss_weights["big"])
             except StopIteration:
                 pass
-            
-            # Handle GC task
+
+            # Compute phase 1 loss and update
+            if task_losses:
+                phase1_loss = sum(task_losses)
+
+                # Zero gradients
+                self.optim.zero_grad()
+
+                # Mixed precision training
+                if self.use_amp:
+                    self.scaler.scale(phase1_loss).backward()
+                    self.scaler.step(self.optim)
+                    self.scaler.update()
+                else:
+                    phase1_loss.backward()
+                    self.optim.step()
+
+                # Update learning rate
+                self.optim_schedule.step()
+
+            # ====================== Phase 2: GC task ======================
             try:
                 gc_batch = next(gc_iter)
                 gc_task_dict = self.prepare_task_dict(gc_batch)
                 gc_loss, _ = self.model(gc_task_dict)
-                task_losses.append(gc_loss)
+                gc_loss_weighted = gc_loss * self.loss_weights["gc"]
+
+                # Zero gradients
+                self.optim.zero_grad()
+
+                # Mixed precision training
+                if self.use_amp:
+                    self.scaler.scale(gc_loss_weighted).backward()
+                    self.scaler.step(self.optim)
+                    self.scaler.update()
+                else:
+                    gc_loss_weighted.backward()
+                    self.optim.step()
+
+                # Update learning rate
+                self.optim_schedule.step()
             except StopIteration:
-                pass
-            
-            # If no tasks processed, skip
-            if len(task_losses) == 0:
-                continue
-                
-            # Compute total loss
-            total_batch_loss = sum(task_losses)
-            
-            # Zero gradients
-            self.optim.zero_grad()
-            
-            # Mixed precision training
-            if self.use_amp:
-                self.scaler.scale(total_batch_loss).backward()
-                self.scaler.step(self.optim)
-                self.scaler.update()
-            else:
-                total_batch_loss.backward()
-                self.optim.step()
-            
-            # Record loss
-            total_loss += total_batch_loss.item()
+                gc_loss_weighted = 0
+
+            # ====================== Compute total loss ======================
+            # Compute total batch loss (for logging)
+            batch_loss = phase1_loss.item() if task_losses else 0
+            batch_loss += gc_loss_weighted.item() if gc_loss_weighted != 0 else 0
+
+            # Accumulate loss
+            total_loss += batch_loss
             total_batches += 1
-            
+
             # Update progress bar
             avg_loss = total_loss / total_batches
-            data_iter.set_postfix(loss=total_batch_loss.item(), avg_loss=avg_loss)
+            data_iter.set_postfix(loss=batch_loss, avg_loss=avg_loss)
 
             # Log to wandb
             if i % self.log_freq == 0:
                 log_data = {
                     "batch": epoch * max_batches + i,
-                    "batch_train_loss": total_batch_loss.item(),
+                    "batch_train_loss": batch_loss,
                     "batch_avg_train_loss": avg_loss,
-                    "lr": self.optim_schedule.get_last_lr()[0]
+                    "lr": self.optim_schedule.get_last_lr()[0],
+                    "freeze_mlm": int(freeze_mlm)
                 }
-                
-                # Log each task loss
-                if len(task_losses) > 0:
+
+                # Log each task's loss
+                if mlm_loss != 0:
                     log_data["mlm_loss"] = mlm_loss.item()
-                if len(task_losses) > 1:
+                if anp_loss != 0:
                     log_data["anp_loss"] = anp_loss.item()
-                if len(task_losses) > 2:
+                if big_loss != 0:
                     log_data["big_loss"] = big_loss.item()
-                if len(task_losses) > 3:
+                if gc_loss != 0:
                     log_data["gc_loss"] = gc_loss.item()
-                
+
                 wandb.log(log_data)
-            
-            # Update learning rate
-            self.optim_schedule.step()
-        
+
         avg_epoch_loss = total_loss / total_batches if total_batches > 0 else 0.0
         print(f"Epoch {epoch+1} Train loss: {avg_epoch_loss:.4f}")
         return avg_epoch_loss
@@ -603,7 +659,7 @@ class BERT4PretrainTrainer(BERT2PretrainTrainer):
         self.model.eval()
         total_loss = 0.0
         total_batches = 0
-        
+    
         # Validate MLM task
         with torch.no_grad():
             for mlm_batch in mlm_valid_loader:
@@ -656,7 +712,7 @@ class BERT4PretrainTrainer(BERT2PretrainTrainer):
 class BERTFinetuneTrainer:
     def __init__(
         self,
-        model,
+        model: CFGFusionModel,
         train_dataset,  # Full training dataset
         val_dataset,    # Full validation dataset
         config
@@ -692,7 +748,7 @@ class BERTFinetuneTrainer:
             betas=config.betas, 
             weight_decay=config.weight_decay
         )
-        self.criterion = nn.BCEWithLogitsLoss()
+        self.criterion = nn.CosineEmbeddingLoss(margin=0.0)
         
         # Calculate total global steps
         train_samples_per_epoch = int(len(train_dataset) * config.train_sample_ratio)
@@ -862,8 +918,10 @@ class BERTFinetuneTrainer:
             labels = labels.to(self.device)
             
             with torch.autocast(device_type=self.device, enabled=self.use_amp):
-                outputs = self.model(a_ids, a_adj, t_ids, t_adj)
-                loss = self.criterion(outputs, labels)
+                a_embeddings = self.model(a_ids, a_adj)
+                t_embeddings = self.model(t_ids, t_adj)
+                cosine_sim = F.cosine_similarity(a_embeddings, t_embeddings, dim=1)
+                loss = self.criterion(cosine_sim, labels.float())
             
             # Backpropagation
             self.optimizer.zero_grad()
@@ -909,13 +967,16 @@ class BERTFinetuneTrainer:
                 a_ids, t_ids = a_ids.to(self.device), t_ids.to(self.device)
                 a_adj, t_adj = a_adj.to(self.device), t_adj.to(self.device)
                 labels = labels.to(self.device)
-                
-                outputs = self.model(a_ids, a_adj, t_ids, t_adj)
-                loss = self.criterion(outputs, labels)
+                a_embeddings = self.model(a_ids, a_adj)
+                t_embeddings = self.model(t_ids, t_adj)
+                cosine_sim = F.cosine_similarity(a_embeddings, t_embeddings, dim=1)
+                loss = self.criterion(cosine_sim, labels.float())
                 
                 # Calculate accuracy
-                probs = torch.sigmoid(outputs)
-                predictions = (probs > 0.5).float()
+                idx = cosine_sim > 0
+                predictions = torch.zeros_like(cosine_sim)
+                predictions[idx] = 1
+                predictions[~idx] = -1
                 correct += (predictions.to(torch.int32) == labels.to(torch.int32)).sum().item()
                 total += labels.size(0)
                 

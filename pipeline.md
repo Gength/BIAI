@@ -317,10 +317,52 @@ Platform = \[x86, x64\], Optimization = \[O0, O1, O2, O3, Os\], generate combina
 ## Loss Function
 - MLM loss: Uses negative log likelihood loss to compute prediction error at masked positions, ignoring `<CLS>` and `<PAD>` tokens.
 - ANP, BIG, GC loss: Uses cross-entropy loss to compute prediction error for positive/negative sample pairs.
-- Total loss: MLM loss + ANP loss + BIG loss + GC loss, with weights set to 1.0 for all tasks.
+- Total loss: MLM loss + ANP loss + BIG loss + GC loss, with variable weights.
+
+## Training
+1. Use AdamW optimizer with weight decay.
+2. Learning rate: 1e-4, weight decay: 0.01.
+3. Learning rate scheduler: cosine decay with warmup 30% of total steps, maximum learning rate 1e-3.
+3. Batch size: 10
+
+### Equal Weights Training
+- MLM: 1.0, ANP: 1.0, BIG: 1.0, GC: 1.0
+$$loss = loss_{MLM}*1.0 + loss_{ANP} *1.0 + loss_{BIG}* 1.0 + loss_{GC} $$
+#### Results
+The BIG loss converges to 0.7 in the binary classification task, which is very close to the loss of random guessing (0.693), indicating that the model may have learned little useful information and its performance is close to random guessing.
+
+### Dynamic Weights Training
+- Initial weights: MLM=0.5, ANP=2.0, BIG=2.0, GC=1.0
+- Every 100 steps: Recalculate weights based on the average loss of each task.
+- Formula:
+    - $task\_new\_weight = 0.8* (\frac{max \ loss}  {avg \ loss + ε}) ^ {0.8}$
+    - Smooth update: $task\_weight = 0.2*old\_weight + 0.8 * task\_new\_weight$
+- Effect: Tasks with higher loss have their weights reduced, while tasks with lower loss have their weights increased.
+#### Results
+BIG loss did not show significant improvement.
+
+### Fixed Weights Training
+- MLM: 0.5, ANP: 2.0, BIG: 2.0, GC: 1.0
+$$loss = loss_{MLM}*0.5 + loss_{ANP} *2.0 + loss_{BIG}* 2.0 + loss_{GC}*1.0 $$
+#### Results
+BIG loss did not show significant improvement.
+
+### Further Improvement Methods
+#### Method 1
+- remove learning rate scheduler, use fixed learning rate 1e-4 (paper's setting).
+- Add Segment Embedding 
+- Switch from Post-LayerNorm to Pre-LayerNorm architecture
+- In encode(), return the representation at the `[CLS]` position
+#### Method 2
+- keep settings from Method 1, use a learning rate scheduler with warmup 30% of total steps, maximum learning rate 1e-3, starts from 1e-5
+
+#### Method 3
+- split the training into two stages:
+  - Stage 1: Pretrain BERT4 with MLM, ANP, and BIG tasks, when mlm loss converges, only train ANP and BIG tasks.
+  - Stage 2: Fine-tune BERT4 with GC task.
 
 ## TODO
-- in MLM, ANP, BIG Tasks, the context size is 2, which is too small. Need to increase the context size to 3 or more. We should also generate block pairs based on cfg structure, not just adjacent blocks.
+- In MLM, ANP, and BIG tasks, the context size is 2, which is too small. The context size should be increased to 3 or more. Block pairs should also be generated based on the CFG structure, not just adjacent blocks.
 - expand platform to include more architectures (e.g., ARM, MIPS) and compilers (e.g., clang).
 
 # Supervised Function Similarity Learning

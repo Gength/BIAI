@@ -13,6 +13,7 @@ class MLMCollateFn:
 
     def __call__(self, batches):
         ids_output = []
+        segment_ids_output = []
         labels_output = []
         
         for batch in batches:
@@ -32,6 +33,7 @@ class MLMCollateFn:
             
             for start_idx in sampled_start_indices:
                 text = "<CLS> " + instruction_blocks[start_idx] + " <SEP> " + instruction_blocks[start_idx+1]
+                segment_id = [0] * (len(instruction_blocks[start_idx]) + 1) + [1] * (len(instruction_blocks[start_idx+1]) + 1)
                 ids = self.tokenizer.encode(text)
                 
                 if self.train:
@@ -42,15 +44,19 @@ class MLMCollateFn:
                 # Truncate and pad
                 ids = ids[:self.seq_len]
                 labels = labels[:self.seq_len]
+                segment_id = segment_id[:self.seq_len]
                 ids = pad_sequence(ids, self.seq_len, self.tokenizer.pad_token_id)
+                segment_id = pad_sequence(segment_id, self.seq_len, 0)  # Pad segment IDs
                 labels = pad_sequence(labels, self.seq_len, 0) # Note: label for padding part should be 0 (ignore loss)
                 
                 ids_output.append(torch.tensor(ids, dtype=torch.int))
+                segment_ids_output.append(torch.tensor(segment_id, dtype=torch.int))
                 labels_output.append(torch.tensor(labels, dtype=torch.long))
         
         return {
             'task_type': 'mlm',
             "input_ids": torch.stack(ids_output, dim=0),
+            "segment_ids": torch.stack(segment_ids_output, dim=0),
             "labels": torch.stack(labels_output, dim=0)
         }
 
@@ -64,6 +70,7 @@ class ANPCollateFn:
     def __call__(self, batches):
         ids_output = []
         labels_output = []
+        segment_ids_output = []
         
         for batch in batches:
             instruction_blocks = batch["instruction_blocks"]
@@ -129,6 +136,7 @@ class ANPCollateFn:
             for (i, j), label in zip(all_pairs, pair_labels):
                 # Format and encode text
                 text = "<CLS> " + instruction_blocks[i] + " <SEP> " + instruction_blocks[j]
+                segment_id = [0] * (len(instruction_blocks[i]) + 1) + [1] * (len(instruction_blocks[j]) + 1)
                 ids = self.tokenizer.encode(text)
                 
                 # Apply random mask during training
@@ -137,11 +145,14 @@ class ANPCollateFn:
                 
                 # Truncate and pad
                 ids = ids[:self.seq_len]
+                segment_id = segment_id[:self.seq_len]
                 ids = pad_sequence(ids, self.seq_len, self.tokenizer.pad_token_id)
+                segment_id = pad_sequence(segment_id, self.seq_len, 0)  # Pad segment IDs
                 ids_tensor = torch.tensor(ids, dtype=torch.int)
                 label_tensor = torch.tensor(label, dtype=torch.long)
                 
                 ids_output.append(ids_tensor)
+                segment_ids_output.append(torch.tensor(segment_id, dtype=torch.int))
                 labels_output.append(label_tensor)
         
         # Handle empty batch
@@ -149,12 +160,14 @@ class ANPCollateFn:
             return {
                 'task_type': 'anp',
                 "input_ids": torch.tensor([], dtype=torch.int),
+                "segment_ids": torch.tensor([], dtype=torch.int),
                 "labels": torch.tensor([], dtype=torch.long)
             }
         
         return {
             'task_type': 'anp',
             "input_ids": torch.stack(ids_output),
+            "segment_ids": torch.stack(segment_ids_output),
             "labels": torch.stack(labels_output)
         }
 
@@ -193,6 +206,8 @@ class BIGCollateFn:
                 
                 # Build input sequence: <CLS> block1 <SEP> block2
                 text = "<CLS> " + block1 + " <SEP> " + block2
+                segment_ids = [0] * (len(block1) + 1) + [1] * (len(block2) + 1)
+
                 ids = self.tokenizer.encode(text)
                 
                 # Apply random mask during training
@@ -203,10 +218,12 @@ class BIGCollateFn:
                 
                 # Truncate and pad
                 masked_ids = masked_ids[:self.seq_len]
+                segment_ids = segment_ids[:self.seq_len]
                 masked_ids = pad_sequence(masked_ids, self.seq_len, self.tokenizer.pad_token_id)
+                segment_ids = pad_sequence(segment_ids, self.seq_len, 0)  # Pad segment IDs
                 
                 # Add as positive sample (label 1)
-                samples.append((torch.tensor(masked_ids, dtype=torch.long), 1))
+                samples.append((masked_ids, segment_ids, 1))
         
         # Generate negative samples (block pairs from different functions)
         n_neg_samples = len(samples)  # Match number of positive samples
@@ -228,6 +245,7 @@ class BIGCollateFn:
             # Build input sequence: <CLS> block1 <SEP> block2
             text = "<CLS> " + block1 + " <SEP> " + block2
             ids = self.tokenizer.encode(text)
+            segment_ids = [0] * (len(block1) + 1) + [1] * (len(block2) + 1)
             
             # Apply random mask during training
             if self.train:
@@ -237,10 +255,12 @@ class BIGCollateFn:
             
             # Truncate and pad
             masked_ids = masked_ids[:self.seq_len]
+            segment_ids = segment_ids[:self.seq_len]
             masked_ids = pad_sequence(masked_ids, self.seq_len, self.tokenizer.pad_token_id)
+            segment_ids = pad_sequence(segment_ids, self.seq_len, 0)  # Pad segment IDs
             
             # Add as negative sample (label 0)
-            samples.append((torch.tensor(masked_ids, dtype=torch.int), 0))
+            samples.append((masked_ids, segment_ids, 0))
         
         # Shuffle all samples together
         random.shuffle(samples)
@@ -250,15 +270,17 @@ class BIGCollateFn:
             return {
                 'task_type': 'big',
                 "input_ids": torch.tensor([]),
+                "segment_ids": torch.tensor([]),
                 "labels": torch.tensor([])
             }
         
         # Unzip into separate lists
-        input_ids_list, labels_list = zip(*samples)
+        input_ids_list, segment_ids_list, labels_list = zip(*samples)
         
         return {
             'task_type': 'big',
-            "input_ids": torch.stack(input_ids_list, dim=0),
+            "input_ids": torch.stack([torch.tensor(x, dtype=torch.int) for x in input_ids_list]),
+            "segment_ids": torch.stack([torch.tensor(x, dtype=torch.int) for x in segment_ids_list]),
             "labels": torch.tensor(labels_list, dtype=torch.long)
         }
 
@@ -271,6 +293,7 @@ class GCCollateFn:
     def __call__(self, batches):
         input_ids_list = []
         labels_list = []
+        segment_ids_list = []
         
         for batch in batches:
             instruction_blocks = batch["instruction_blocks"]
@@ -284,24 +307,31 @@ class GCCollateFn:
             for block in sampled_blocks:
                 text = "<CLS> " + block
                 ids = self.tokenizer.encode(text)
+                segment_ids = [0] * (len(block) + 1)
                 ids = ids[:self.seq_len]
+                segment_ids = segment_ids[:self.seq_len]
                 ids = pad_sequence(ids, self.seq_len, self.tokenizer.pad_token_id)
+                segment_ids = pad_sequence(segment_ids, self.seq_len, 0)  # Pad segment IDs
                 input_ids_list.append(torch.tensor(ids, dtype=torch.int))
+                segment_ids_list.append(torch.tensor(segment_ids, dtype=torch.int))
                 labels_list.append(opt_arch_idx)
  
         if len(input_ids_list) == 0:
             return {
                 'task_type': 'gc',
                 "input_ids": torch.tensor([]),
+                "segment_ids": torch.tensor([]),
                 "labels": torch.tensor([])
             }
         
         input_ids_tensor = torch.stack(input_ids_list, dim=0)
+        segment_ids_tensor = torch.stack(segment_ids_list, dim=0)
         labels_tensor = torch.tensor(labels_list, dtype=torch.long)
         
         return {
             'task_type': 'gc',
             "input_ids": input_ids_tensor,
+            "segment_ids": segment_ids_tensor,
             "labels": labels_tensor
         }
 class CombinedCollateFn:

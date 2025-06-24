@@ -96,9 +96,9 @@ class MultiHeadedAttention(nn.Module):
         """
         B, L, _ = query.size()
 
-        Q = self.q_linear(query).view(B, L, self.heads, self.d_k).transpose(1, 2)  # [B, h, L, d_k]
-        K = self.k_linear(key).view(B, L, self.heads, self.d_k).transpose(1, 2)
-        V = self.v_linear(value).view(B, L, self.heads, self.d_k).transpose(1, 2)
+        Q = self.q_linear(query).view(B, L, self.heads, self.d_k).permute(0, 2, 1, 3)  # [B, h, L, d_k]
+        K = self.k_linear(key).view(B, L, self.heads, self.d_k).permute(0, 2, 1, 3)
+        V = self.v_linear(value).view(B, L, self.heads, self.d_k).permute(0, 2, 1, 3)
 
         if mask is not None:
             mask = mask.expand(-1, self.heads, -1, -1)
@@ -134,71 +134,79 @@ class MaskedLanguageModel(torch.nn.Module):
 		return self.softmax(self.linear(x))
 
 class EncoderLayer(torch.nn.Module):
-	def __init__(
-		self, 
-		d_model=768,
-		heads=12, 
-		feed_forward_hidden=768 * 4, 
-		dropout=0.1
-		):
-		super(EncoderLayer, self).__init__()
-		self.layernorm = torch.nn.LayerNorm(d_model)
-		self.self_multihead = MultiHeadedAttention(heads, d_model)
-		self.feed_forward = FeedForward(d_model, middle_dim=feed_forward_hidden)
-		self.dropout = torch.nn.Dropout(dropout)
+    def __init__(
+        self, 
+        d_model=768,
+        heads=12, 
+        feed_forward_hidden=768 * 4, 
+        dropout=0.1
+        ):
+        super(EncoderLayer, self).__init__()
+        self.layernorm1 = torch.nn.LayerNorm(d_model)
+        self.layernorm2 = torch.nn.LayerNorm(d_model)
+        self.self_multihead = MultiHeadedAttention(heads, d_model)
+        self.feed_forward = FeedForward(d_model, middle_dim=feed_forward_hidden)
+        self.dropout = torch.nn.Dropout(dropout)
 
-	def forward(self, embeddings, mask):
-		"""
-		Inputs:
-			embeddings: [batch_size, seq_len, d_model]
-			mask: [batch_size, 1, 1, seq_len]
-		Output: 
-			encoded representations [batch_size, seq_len, d_model]
-		"""
-		interacted = self.dropout(self.self_multihead(embeddings, embeddings, embeddings, mask))
-		# residual layer
-		interacted = self.layernorm(interacted + embeddings)
-		# bottleneck
-		feed_forward_out = self.dropout(self.feed_forward(interacted))
-		encoded = self.layernorm(feed_forward_out + interacted)
-		return encoded
+    def forward(self, x, mask):
+        """
+        Inputs:
+            x: [batch_size, seq_len, d_model]
+            mask: [batch_size, 1, 1, seq_len]
+        Output: 
+            encoded representations [batch_size, seq_len, d_model]
+        """
+        normed = self.layernorm1(x)
+        attn_output = self.self_multihead(normed, normed, normed, mask)
+        x = x + self.dropout(attn_output)
+        
+        normed = self.layernorm2(x)
+        ff_output = self.feed_forward(normed)
+        x = x + self.dropout(ff_output)
+        return x
 
 
 class BERTEmbedding(torch.nn.Module):
-	"""
-	BERT Embedding which is consisted with under features
-		1. TokenEmbedding : normal embedding matrix
-		2. PositionalEmbedding : adding positional information using sin, cos
-		2. SegmentEmbedding : adding sentence segment info, (sent_A:1, sent_B:2)
-		sum of all these features are output of BERTEmbedding
-	"""
+    """
+    BERT Embedding which is consisted with under features
+        1. TokenEmbedding : normal embedding matrix
+        2. PositionalEmbedding : adding positional information using sin, cos
+        2. SegmentEmbedding : adding sentence segment info, (sent_A:1, sent_B:2)
+        sum of all these features are output of BERTEmbedding
+    """
 
-	def __init__(self, vocab_size, embed_size=128, seq_len=128, dropout=0.1):
-		"""
-		:param vocab_size: total vocab size
-		:param embed_size: embedding size of token embedding
-		:param dropout: dropout rate
-		"""
+    def __init__(self, vocab_size, embed_size=128, seq_len=128, dropout=0.1):
+        """
+        :param vocab_size: total vocab size
+        :param embed_size: embedding size of token embedding
+        :param dropout: dropout rate
+        """
 
-		super().__init__()
-		self.embed_size = embed_size
-		# (m, seq_len) --> (m, seq_len, embed_size)
-		# padding_idx is not updated during training, remains as fixed pad (0)
-		self.token = torch.nn.Embedding(vocab_size, embed_size, padding_idx=0)
-		self.position = PositionalEmbedding(d_model=embed_size, max_len=seq_len)
-		self.dropout = torch.nn.Dropout(p=dropout)
-	   
-	def forward(self, sequence):
-		"""
-		Input: 
-			sequence: token indices [batch_size, seq_len]
-		Output: 
-			combined embeddings [batch_size, seq_len, embed_size]
-		"""
-		token_embedding = self.token(sequence)
-		position_embedding = self.position(sequence)
-		x = token_embedding + position_embedding
-		return self.dropout(x)
+        super().__init__()
+        self.embed_size = embed_size
+        # (m, seq_len) --> (m, seq_len, embed_size)
+        # padding_idx is not updated during training, remains as fixed pad (0)
+        self.token = torch.nn.Embedding(vocab_size, embed_size, padding_idx=0)
+        self.position = PositionalEmbedding(d_model=embed_size, max_len=seq_len)
+        self.segment = torch.nn.Embedding(2, embed_size)  # 2 segments: A and B
+        self.dropout = torch.nn.Dropout(p=dropout)
+        
+    def forward(self, sequence, segment_ids=None):
+        """
+        Input: 
+            sequence: token indices [batch_size, seq_len]
+            segment_ids: segment indices [batch_size, seq_len] (optional), segment A: 0, segment B: 1
+        Output: 
+            combined embeddings [batch_size, seq_len, embed_size]
+        """
+        if segment_ids is None:
+            segment_ids = torch.zeros_like(sequence)  # Assuming all tokens belong to segment A
+
+        segment_embedding = self.segment(segment_ids)
+        token_embedding = self.token(sequence)
+        position_embedding = self.position(sequence)
+        x = token_embedding + position_embedding + segment_embedding
+        return self.dropout(x)
 
 class BERT_Block(torch.nn.Module):
 	"""
@@ -231,7 +239,7 @@ class BERT_Block(torch.nn.Module):
 		self.mask_lm = MaskedLanguageModel(self.d_model, vocab_size)
 		self.device = device
 
-	def forward(self, x):
+	def forward(self, x, segment_ids=None):
 		"""
 		Input: 
 			x: token indices [batch_size, seq_len]
@@ -245,7 +253,7 @@ class BERT_Block(torch.nn.Module):
 		mask = (x > 0).unsqueeze(1).unsqueeze(2)
 
 		# embedding the indexed sequence to sequence of vectors
-		x = self.embedding(x)
+		x = self.embedding(x, segment_ids)
 
 		# running over multiple transformer blocks
 		for encoder in self.encoder_blocks:
@@ -253,7 +261,7 @@ class BERT_Block(torch.nn.Module):
 		x = self.mask_lm(x)
 		return x
 
-	def encode(self, input):
+	def encode(self, input, segment_ids=None):
 		"""
 		Input: 
 			input: token indices [batch_size, seq_len]
@@ -262,12 +270,10 @@ class BERT_Block(torch.nn.Module):
 		"""
 		input = input.to(self.device)
 		mask = (input > 0).unsqueeze(1).unsqueeze(2)  # (B,1,1,L)
-		x = self.embedding(input)
+		x = self.embedding(input, segment_ids)
 		for encoder in self.encoder_blocks:
 			x = encoder(x, mask)
-		attention_mask = (input > 0).float().unsqueeze(-1)  # (B,L,1)
-		summed = torch.sum(x * attention_mask, dim=1)
-		return summed
+		return x[:, 0, :]  # Take the first token's embedding (CLS token)
 
 class BERT(nn.Module):
     def __init__(self, vocab_size, d_model=128, n_layers=12, 
@@ -293,11 +299,11 @@ class BERT(nn.Module):
         task_type = input_dict['task_type']
         
         if task_type == 'mlm':
-            return self.forward_mlm(input_dict['input_ids'], input_dict['labels'])
+            return self.forward_mlm(input_dict['input_ids'], input_dict['segment_ids'], input_dict['labels'])
         else:
             raise ValueError(f"Unknown Task Type: {task_type}")
 
-    def forward_mlm(self, input_ids, labels):
+    def forward_mlm(self, input_ids, segment_ids, labels):
         """
         Inputs (assumed to be on correct device):
             input_ids: token indices [batch_size, seq_len]
@@ -305,18 +311,18 @@ class BERT(nn.Module):
         Output: 
             (loss, logits) where logits [batch_size, seq_len, vocab_size]
         """
-        log_probs = self.bert(input_ids)
+        log_probs = self.bert(input_ids, segment_ids)
         loss = F.nll_loss(log_probs.view(-1, log_probs.size(-1)), labels.view(-1), ignore_index=0)
         return loss, log_probs
 
-    def encode(self, input_ids):
+    def encode(self, input_ids, segment_ids=None):
         """
         Input (assumed to be on correct device):
             input_ids: token indices [batch_size, seq_len]
         Output: 
             block embedding [batch_size, d_model]
         """
-        return self.bert.encode(input_ids)
+        return self.bert.encode(input_ids, segment_ids)
 
 class ANPHead(nn.Module):
     def __init__(self, hidden_dim):
@@ -355,16 +361,17 @@ class BERT2(BERT):
         task_type = input_dict['task_type']
         
         if task_type == 'mlm':
-            return self.forward_mlm(input_dict['input_ids'], input_dict['labels'])
+            return self.forward_mlm(input_dict['input_ids'], input_dict['segment_ids'], input_dict['labels'])
         elif task_type == 'anp':
             return self.forward_anp(
                 input_dict['input_ids'], 
+                input_dict['segment_ids'],
                 input_dict['labels']
             )
         else:
             raise ValueError(f"Unknown Task Type: {task_type}")
 
-    def forward_anp(self, input, labels):
+    def forward_anp(self, input, segment_ids, labels):
         """
         judge whether two blocks are adjacent in a graph
         Inputs (assumed to be on correct device):
@@ -373,7 +380,7 @@ class BERT2(BERT):
         Output: 
             (loss, logits) where logits [batch_size, 2]
         """
-        vec = self.encode(input)
+        vec = self.encode(input, segment_ids)
         logits = self.anp_head(vec)
         loss = F.cross_entropy(logits, labels)
         return loss, logits
@@ -440,17 +447,19 @@ class BERT4(BERT2):
         elif task_type == 'big':
             return self.forward_big(
                 input_dict['input_ids'], 
+                input_dict['segment_ids'],
                 input_dict['labels']
             )
         elif task_type == 'gc':
             return self.forward_gc(
                 input_dict['input_ids'], 
+                input_dict['segment_ids'],
                 input_dict['labels']
             )
         else:
             raise ValueError(f"Unknown Task Type: {task_type}")
 
-    def forward_big(self, input_ids, labels):
+    def forward_big(self, input_ids, segment_ids, labels):
         """
         Inputs (assumed to be on correct device):
             input_a: block A tokens [batch_size, seq_len]
@@ -459,12 +468,12 @@ class BERT4(BERT2):
         Output: 
             (loss, logits) where logits [batch_size, 2]
         """
-        vec = self.encode(input_ids)
+        vec = self.encode(input_ids, segment_ids)
         logits = self.big_head(vec)
         loss = F.cross_entropy(logits, labels)
         return loss, logits
 
-    def forward_gc(self, input_ids, labels):
+    def forward_gc(self, input_ids, segment_ids, labels):
         """
         Inputs (assumed to be on correct device):
             input_ids: token indices [batch_size, seq_len]
@@ -472,7 +481,7 @@ class BERT4(BERT2):
         Output: 
             (loss, logits) where logits [batch_size, num_classes]
         """
-        vec = self.encode(input_ids)
+        vec = self.encode(input_ids, segment_ids)
         logits = self.gc_head(vec)
         loss = F.cross_entropy(logits, labels)
         return loss, logits
