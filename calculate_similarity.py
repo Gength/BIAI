@@ -1,20 +1,18 @@
 import pandas as pd
 import os
-import argparse
-from models.dataset import FunctionPairDataset
+from models.dataset import SparseFunctionPairDataset as FunctionPairDataset
 from models.tokenizer import AsmTokenizer
 import torch
 from torch.utils.data import DataLoader
 from models.bert import BERT2, BERT4
-from models.model import CFGFusionModel
+from models.sparse_model import CFGFusionModel
 from tqdm import tqdm
 import torch.nn.functional as F
+from models.collatefn import sparse_pair_collate_fn
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Command line parameters")
-    parser.add_argument("--device", default="cuda", dest="device")
-    parser.add_argument("--batch_size", type=int, default=150, dest="batch_size")
-    args = parser.parse_args()
+    device = torch.device('cuda')
+    batch_size = 2
     seq_len = 128
     tokenizer = AsmTokenizer(
         vocab_file=os.path.join("outputs", f"baseline-vocab.txt")
@@ -29,15 +27,16 @@ if __name__ == "__main__":
         function_idx_mapping_path=os.path.join("outputs", "test-function-idx-mapping.pkl"),
         tokenizer=tokenizer,
         seq_len=128,
-        max_blocks=50
+        max_nodes=500
     )
     test_data_loader = DataLoader(
         test_dataset,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=8,
         prefetch_factor=4,  # Prefetch data for faster loading
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=sparse_pair_collate_fn,
     )
     bert_model = BERT2(
         vocab_size=len(tokenizer.vocab),
@@ -45,20 +44,20 @@ if __name__ == "__main__":
         n_layers=12,
         heads=8,
         seq_len=seq_len,
-        device=args.device
+        device=device
     )
     model = CFGFusionModel(
         bert_model=bert_model,
         d_model=128,
         hidden_dim=64,
-        device=args.device
+        device=device
     )
     model.load_state_dict(
         torch.load(
             os.path.join("outputs", "bert2-finetune", "CFGFusion-best.pth")
         )
     )
-    model = model.to(args.device)
+    model = model.to(device)
     model.eval()
     correct = 0
     total = 0
@@ -67,8 +66,11 @@ if __name__ == "__main__":
     progress_bar = tqdm(total=len(test_data_loader), desc="Testing", unit="batch")
     with torch.no_grad():
         for a_ids, a_adj, t_ids, t_adj, labels in test_data_loader:
-            a_ids, a_adj = a_ids.to(args.device), a_adj.to(args.device)
-            t_ids, t_adj = t_ids.to(args.device), t_adj.to(args.device)
+            if len(a_ids) == 0 or len(t_ids) == 0:
+                continue
+            if isinstance(a_ids, torch.Tensor):
+                a_ids, a_adj = a_ids.to(device), a_adj.to(device)
+                t_ids, t_adj = t_ids.to(device), t_adj.to(device)
             labels = labels.to(torch.int)
             a_embeddings = model(a_ids, a_adj)
             t_embeddings = model(t_ids, t_adj)
@@ -86,11 +88,4 @@ if __name__ == "__main__":
     progress_bar.close()
     accuracy = correct / total
     print(f"Final Accuracy: {accuracy:.4f}")
-    # Save predictions to CSV
-    function_pool = pd.read_csv(function_pool_path)
-    function_pool['label'] = function_pool['label'].astype(int)
-    function_pool[function_pool['label'] == 0] = -1 
-    function_pool["prediction"] = predictions_collect
-    function_pool.to_csv(output_csv_path, index=False)
-    print(f"Predictions saved to {output_csv_path}")
 

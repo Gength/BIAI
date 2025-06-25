@@ -2,7 +2,7 @@ import os
 from models.bert import BERT2
 from models.tokenizer import AsmTokenizer
 from models.dataset import FunctionDataset
-from models.trainer import BERT2PretrainTrainer
+from models.trainer import BERTPretrainTrainer
 import torch.nn as nn
 
 class Config:
@@ -14,20 +14,17 @@ class Config:
     weight_decay=0.01
     betas=(0.9, 0.999)
     device = "cuda"
-    checkpoint_save_path = os.path.join("outputs", "bert2-improved-pretrain-lrscheduler")
+    checkpoint_save_path = os.path.join("outputs", "bert2-pretrain")
     use_amp = True  # Use Automatic Mixed Precision (AMP) if available
     use_wandb = True  # Use Weights & Biases for logging
-    wandb_run = "bert2-improved-pretrain-lrscheduler"  # Weights & Biases run name
+    wandb_run = "bert2-pretrain"  # Weights & Biases run name
     wandb_project = "bert4-training"  # Weights & Biases project name
     train_sample_ratio = 0.2  # 20% training set sampling ratio
     val_sample_ratio = 0.2    # 20% validation set sampling ratio
-
-# Dummy context manager for non-mixed precision training
-class dummy_context:
-    def __enter__(self):
-        return None
-    def __exit__(self, exc_type, exc_value, traceback):
-        pass
+    train_mlm = True
+    train_anp = True
+    train_big = False
+    train_gc = False
 
 if __name__ == "__main__":
     config = Config()
@@ -77,7 +74,7 @@ if __name__ == "__main__":
             nn.init.constant_(module.bias, 0)
     
     # Create trainers
-    trainer = BERT2PretrainTrainer(
+    trainer = BERTPretrainTrainer(
         model=bert_model,
         train_dataset=train_function_dataset,   # Pass full training dataset
         valid_dataset=val_function_dataset,   # Pass full validation dataset

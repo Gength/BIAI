@@ -363,13 +363,15 @@ def sparse_pair_collate_fn(batch):
     labels = []
     
     for a_ids, a_adj, t_ids, t_adj, label in batch:
+        if a_ids is None or t_ids is None:
+            continue
         a_input_ids_list.append(a_ids)
         a_adj_list.append(a_adj)
         t_input_ids_list.append(t_ids)
         t_adj_list.append(t_adj)
         labels.append(label)
-    
-    # 标签可以直接堆叠
+    if len(labels) == 0:
+        return (torch.tensor([]), torch.tensor([]), torch.tensor([]), torch.tensor([]), torch.tensor([]))
     labels = torch.stack(labels, dim=0)
     
     return (a_input_ids_list, a_adj_list, 

@@ -112,23 +112,25 @@ class MPNN(nn.Module):
 
 
 class ResNetBlock(nn.Module):
+    """ResNet block with 3 convolutional layers per block"""
     def __init__(self, channels):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(channels)
         self.bn2 = nn.BatchNorm2d(channels)
+        self.bn3 = nn.BatchNorm2d(channels)
 
     def forward(self, x):
-        """
-        Input: 
-            x: feature maps [batch_size, channels, height, width]
-        Output: 
-            transformed features [batch_size, channels, height, width]
-        """
         residual = x
+        # First convolution
         out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+        # Second convolution
+        out = F.relu(self.bn2(self.conv2(out)))
+        # Third convolution
+        out = self.bn3(self.conv3(out))
+        # Residual connection
         out += residual
         return F.relu(out)
 
@@ -137,12 +139,17 @@ class OrderCNN(nn.Module):
         super().__init__()
         # Initial convolutional layer
         self.conv_in = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
-        self.bn_in = nn.BatchNorm2d(32)
         
-        # Residual blocks
+        # Residual blocks (3 blocks)
         self.res_blocks = nn.Sequential()
         for i in range(num_blocks):
             self.res_blocks.add_module(f"res_block_{i}", ResNetBlock(32))
+        
+        # Additional convolutional layers to reach 11 layers total
+        # 1 (initial) + 3 blocks * 3 layers each = 10 layers
+        # Add one more convolution to make 11 layers
+        self.conv_out = nn.Conv2d(32, 32, kernel_size=3, padding=1)
+        self.bn_out = nn.BatchNorm2d(32)
         
         # Global max pooling
         self.pool = nn.AdaptiveMaxPool2d((1, 1))
@@ -151,20 +158,17 @@ class OrderCNN(nn.Module):
         self.fc_out = nn.Linear(32, out_features)
 
     def forward(self, adj):
-        """
-        Input: 
-            adj: adjacency matrix [batch_size, num_nodes, num_nodes]
-        Output: 
-            order embedding [batch_size, out_features]
-        """
         # Add channel dimension [batch_size, 1, num_nodes, num_nodes]
         x = adj.unsqueeze(1)
         
         # Initial convolution
-        x = F.relu(self.bn_in(self.conv_in(x)))
+        x = F.relu(self.conv_in(x))
         
-        # Residual blocks
+        # Residual blocks (3 blocks, each with 3 conv layers)
         x = self.res_blocks(x)
+        
+        # Additional convolution to reach 11 layers
+        x = F.relu(self.bn_out(self.conv_out(x)))
         
         # Global pooling [batch_size, 32, 1, 1]
         x = self.pool(x)

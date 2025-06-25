@@ -213,6 +213,10 @@ class SparseFunctionPairDataset(FunctionPairDataset):
 		
 		a_data = self.dataset[a_idx]
 		t_data = self.dataset[t_idx]
+		if len(a_data["instruction_blocks"]) > self.max_nodes or len(t_data["instruction_blocks"]) > self.max_nodes:
+			# Skip this pair if either function exceeds max nodes
+			return (None, None, None, None, None)
+
 		
 		# Process the first function (sparse format)
 		a_input_ids, a_adj = self.process_function(a_data)

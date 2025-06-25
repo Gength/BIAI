@@ -5,12 +5,11 @@ from models.sparse_model import CFGFusionModel
 from models.tokenizer import AsmTokenizer
 from models.dataset import SparseFunctionPairDataset as FunctionPairDataset
 from models.trainer import BERTFinetuneTrainer
-from models.dataset import opt_arch_combinations
 
 # Configuration parameters with sampling ratios
 class Config:
-    batch_size = 4  # A40: 7
-    max_nodes = 200  # Maximum number of basic blocks
+    batch_size = 2  # A40: 7
+    max_nodes = 500  # Maximum number of basic blocks
     seq_len = 128    # Maximum sequence length
     hidden_dim = 64  # Graph embedding dimension
     lr = 1e-4
@@ -19,10 +18,10 @@ class Config:
     epochs = 10
     device = "cuda"
     bert_checkpoint = os.path.join("outputs", "bert2-improved-pretrain-lrscheduler", "bert2-best.pth")  # Pretrained BERT path
-    checkpoint_save_path = os.path.join("outputs", "bert4-finetune")  # Checkpoint save path
+    checkpoint_save_path = os.path.join("outputs", "bert2-finetune")  # Checkpoint save path
     use_amp = True  # Use Automatic Mixed Precision (AMP) if available
-    use_wandb = False  # Use Weights & Biases for logging
-    wandb_run = "bert4-finetune"  # Weights & Biases run name
+    use_wandb = True  # Use Weights & Biases for logging
+    wandb_run = "bert2-finetune"  # Weights & Biases run name
     wandb_project = "bert4-training"  # Weights & Biases project name
     log_freq = 10  
     train_sample_ratio = 0.2  # 20% training set sampling ratio

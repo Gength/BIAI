@@ -50,13 +50,16 @@ class ResNetBlock(nn.Module):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(channels)
         self.bn2 = nn.BatchNorm2d(channels)
+        self.bn3 = nn.BatchNorm2d(channels)
 
     def forward(self, x):
         residual = x
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
+        out = self.bn3(self.conv3(out))
         out += residual
         return F.relu(out)
 
@@ -66,10 +69,12 @@ class OrderCNN(nn.Module):
     def __init__(self, in_channels=1, num_blocks=3, out_features=32):
         super().__init__()
         self.conv_in = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
-        self.bn_in = nn.BatchNorm2d(32)
+
         self.res_blocks = nn.Sequential(*[
             ResNetBlock(32) for _ in range(num_blocks)
         ])
+        self.conv_out = nn.Conv2d(32, 32, kernel_size=3, padding=1)
+        self.bn_out = nn.BatchNorm2d(32)
         self.pool = nn.AdaptiveMaxPool2d((1, 1))
         self.fc_out = nn.Linear(32, out_features)
 
@@ -83,8 +88,9 @@ class OrderCNN(nn.Module):
             x = adj_dense.unsqueeze(0).unsqueeze(0)
             
             # Process through CNN
-            x = F.relu(self.bn_in(self.conv_in(x)))
+            x = F.relu(self.conv_in(x))
             x = self.res_blocks(x)
+            x = F.relu(self.bn_out(self.conv_out(x)))
             x = self.pool(x)
             x = x.view(1, -1)
             embeddings.append(self.fc_out(x))

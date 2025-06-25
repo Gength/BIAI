@@ -10,3 +10,5 @@ duplicated.py
 wandb/
 slurm/
 *sh.o*
+*.out
+*.err
