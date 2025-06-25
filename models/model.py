@@ -231,7 +231,7 @@ class CFGFusionModel(nn.Module):
         node_features = block_embeddings.reshape(batch_size, num_nodes, -1)
         
         # === Structure-aware modeling ===
-        # Generate graph structure embedding [batch_size, d_model]
+        # Generate graph structure embedding [batch_size, 64]
         structure_embedding = self.mpnn(node_features, adj_matrix)
         
         # === Order-aware modeling ===
@@ -239,7 +239,7 @@ class CFGFusionModel(nn.Module):
         order_embedding = self.order_cnn(adj_matrix)
         
         # === Fusion ===
-        # Concatenate structure and order embeddings [batch_size, d_model + 32]
+        # Concatenate structure and order embeddings [batch_size, 96]
         combined = torch.cat([structure_embedding, order_embedding], dim=-1)
         
         # Generate final graph embedding [batch_size, hidden_dim]

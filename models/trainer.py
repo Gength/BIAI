@@ -920,8 +920,7 @@ class BERTFinetuneTrainer:
             with torch.autocast(device_type=self.device, enabled=self.use_amp):
                 a_embeddings = self.model(a_ids, a_adj)
                 t_embeddings = self.model(t_ids, t_adj)
-                cosine_sim = F.cosine_similarity(a_embeddings, t_embeddings, dim=1)
-                loss = self.criterion(cosine_sim, labels.float())
+                loss = self.criterion(a_embeddings, t_embeddings, labels.float())
             
             # Backpropagation
             self.optimizer.zero_grad()
@@ -969,10 +968,10 @@ class BERTFinetuneTrainer:
                 labels = labels.to(self.device)
                 a_embeddings = self.model(a_ids, a_adj)
                 t_embeddings = self.model(t_ids, t_adj)
-                cosine_sim = F.cosine_similarity(a_embeddings, t_embeddings, dim=1)
-                loss = self.criterion(cosine_sim, labels.float())
+                loss = self.criterion(a_embeddings, t_embeddings, labels.float())
                 
                 # Calculate accuracy
+                cosine_sim = F.cosine_similarity(a_embeddings, t_embeddings, dim=1)
                 idx = cosine_sim > 0
                 predictions = torch.zeros_like(cosine_sim)
                 predictions[idx] = 1

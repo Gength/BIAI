@@ -93,9 +93,8 @@ class FunctionPairDataset(Dataset):
 		a_input_ids, a_adj = self.process_function(a_data)
 		# Process the second function
 		t_input_ids, t_adj = self.process_function(t_data)
-		if int(row['label']) == 0:
-			row['label'] = -1
-		label = torch.tensor(row["label"], dtype=torch.float32)
+		label = -1 if int(row["label"]) == 0 else 1  # Convert label to -1 or 1
+		label = torch.tensor(label, dtype=torch.float32)
 		return a_input_ids, a_adj, t_input_ids, t_adj, label
 
 	def process_function(self, func_data):

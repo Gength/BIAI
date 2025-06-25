@@ -18,7 +18,7 @@ class Config:
     weight_decay = 0.01
     epochs = 10
     device = "cuda"
-    bert_checkpoint = os.path.join("outputs", "bert4-pretrain", "bert4"
+    bert_checkpoint = os.path.join("outputs", "bert4-improved-pretrain-equal-weight-lrscheduler", "bert4"
     "-best.pth")  # Pretrained BERT path
     checkpoint_save_path = os.path.join("outputs", "bert4-finetune")  # Checkpoint save path
     use_amp = True  # Use Automatic Mixed Precision (AMP) if available

@@ -1,7 +1,7 @@
 import torch
 import os
 from models.bert import BERT2
-from models.model import CFGFusionModel, SimilarityClassifier
+from models.model import CFGFusionModel
 from models.tokenizer import AsmTokenizer
 from models.dataset import FunctionPairDataset
 from models.trainer import BERTFinetuneTrainer

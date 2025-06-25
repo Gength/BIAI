@@ -70,6 +70,7 @@ def pad_sequence(ids: list, seq_len: int, pad_id) -> list:
     Returns:
         list: A list of token IDs with padding added.
     """
+    ids = ids[:seq_len]  # Truncate to max length
     pad_len = seq_len - len(ids)
     return (ids+ [pad_id] * pad_len
     )
