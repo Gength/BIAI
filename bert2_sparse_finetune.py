@@ -1,15 +1,15 @@
 import torch
 import os
-from models.bert import BERT4
-from models.model import CFGFusionModel
+from models.bert import BERT4, BERT2
+from models.sparse_model import CFGFusionModel
 from models.tokenizer import AsmTokenizer
-from models.dataset import FunctionPairDataset
+from models.dataset import SparseFunctionPairDataset as FunctionPairDataset
 from models.trainer import BERTFinetuneTrainer
 from models.dataset import opt_arch_combinations
 
 # Configuration parameters with sampling ratios
 class Config:
-    batch_size = 7  # A40: 7
+    batch_size = 4  # A40: 7
     max_nodes = 200  # Maximum number of basic blocks
     seq_len = 128    # Maximum sequence length
     hidden_dim = 64  # Graph embedding dimension
@@ -18,11 +18,10 @@ class Config:
     weight_decay = 0.01
     epochs = 10
     device = "cuda"
-    bert_checkpoint = os.path.join("outputs", "bert4-improved-pretrain-equal-weight-lrscheduler", "bert4"
-    "-best.pth")  # Pretrained BERT path
+    bert_checkpoint = os.path.join("outputs", "bert2-improved-pretrain-lrscheduler", "bert2-best.pth")  # Pretrained BERT path
     checkpoint_save_path = os.path.join("outputs", "bert4-finetune")  # Checkpoint save path
     use_amp = True  # Use Automatic Mixed Precision (AMP) if available
-    use_wandb = True  # Use Weights & Biases for logging
+    use_wandb = False  # Use Weights & Biases for logging
     wandb_run = "bert4-finetune"  # Weights & Biases run name
     wandb_project = "bert4-training"  # Weights & Biases project name
     log_freq = 10  
@@ -32,9 +31,9 @@ class Config:
 if __name__ == "__main__":
     def init_model(vocab_size):
         # Load pretrained BERT
-        bert_model = BERT4(
+        bert_model = BERT2(
             vocab_size=vocab_size,
-            num_classes=len(opt_arch_combinations),
+            # num_classes=len(opt_arch_combinations),
             d_model=128,
             n_layers=12,
             heads=8,
@@ -63,7 +62,7 @@ if __name__ == "__main__":
         function_idx_mapping_path=os.path.join("outputs", "train-function-idx-mapping.pkl"),
         tokenizer=tokenizer,
         seq_len=config.seq_len,
-        max_nodes=config.max_nodes,
+        max_nodes=config.max_nodes
     )
     
     val_dataset = FunctionPairDataset(
@@ -72,7 +71,7 @@ if __name__ == "__main__":
         function_idx_mapping_path=os.path.join("outputs", "val-function-idx-mapping.pkl"),
         tokenizer=tokenizer,
         seq_len=config.seq_len,
-        max_nodes=config.max_nodes,
+        max_nodes=config.max_nodes
     )
     
     # Initialize model and trainer

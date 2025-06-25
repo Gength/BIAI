@@ -355,27 +355,23 @@ class CombinedCollateFn:
         else:
             raise ValueError(f"Unknown task type: {task_type}")
 
-def sparse_collate_fn(batch):
-    a_ids_list, a_idx_list, a_val_list = [], [], []
-    t_ids_list, t_idx_list, t_val_list = [], [], []
-    labels_list = []
+def sparse_pair_collate_fn(batch):
+    a_input_ids_list = []
+    a_adj_list = []
+    t_input_ids_list = []
+    t_adj_list = []
+    labels = []
     
-    for item in batch:
-        a_ids, a_idx, a_val, t_ids, t_idx, t_val, label = item
-        a_ids_list.append(a_ids)
-        a_idx_list.append(a_idx)
-        a_val_list.append(a_val)
-        t_ids_list.append(t_ids)
-        t_idx_list.append(t_idx)
-        t_val_list.append(t_val)
-        labels_list.append(label)
+    for a_ids, a_adj, t_ids, t_adj, label in batch:
+        a_input_ids_list.append(a_ids)
+        a_adj_list.append(a_adj)
+        t_input_ids_list.append(t_ids)
+        t_adj_list.append(t_adj)
+        labels.append(label)
     
-    return (
-        torch.stack(a_ids_list),
-        a_idx_list,  # index list
-        a_val_list,  # value list
-        torch.stack(t_ids_list),
-        t_idx_list,  # index list
-        t_val_list,  # value list
-        torch.stack(labels_list)
-    )
+    # 标签可以直接堆叠
+    labels = torch.stack(labels, dim=0)
+    
+    return (a_input_ids_list, a_adj_list, 
+            t_input_ids_list, t_adj_list, 
+            labels)

@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import Adam
-from models.collatefn import MLMCollateFn, ANPCollateFn, BIGCollateFn, GCCollateFn, CombinedCollateFn
+from models.collatefn import MLMCollateFn, ANPCollateFn, BIGCollateFn, GCCollateFn, CombinedCollateFn, sparse_pair_collate_fn
 import wandb
 import tqdm
 from models.dataset import TaskDataset
@@ -379,7 +379,7 @@ class BERT4PretrainTrainer(BERT2PretrainTrainer):
         # 重新计算总步数（每个batch两次更新）
         train_samples_per_epoch = int(len(train_dataset) * config.train_sample_ratio)
         steps_per_epoch = math.ceil(train_samples_per_epoch / config.batch_size)
-        total_steps = 2 * steps_per_epoch * config.epochs  # 乘以2因为每个batch两次更新
+        total_steps = steps_per_epoch * config.epochs
         
         # 重新初始化学习率调度器
         self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
@@ -573,53 +573,31 @@ class BERT4PretrainTrainer(BERT2PretrainTrainer):
             except StopIteration:
                 pass
 
-            # Compute phase 1 loss and update
-            if task_losses:
-                phase1_loss = sum(task_losses)
-
-                # Zero gradients
-                self.optim.zero_grad()
-
-                # Mixed precision training
-                if self.use_amp:
-                    self.scaler.scale(phase1_loss).backward()
-                    self.scaler.step(self.optim)
-                    self.scaler.update()
-                else:
-                    phase1_loss.backward()
-                    self.optim.step()
-
-                # Update learning rate
-                self.optim_schedule.step()
-
-            # ====================== Phase 2: GC task ======================
+            # Handle GC task
             try:
                 gc_batch = next(gc_iter)
                 gc_task_dict = self.prepare_task_dict(gc_batch)
                 gc_loss, _ = self.model(gc_task_dict)
-                gc_loss_weighted = gc_loss * self.loss_weights["gc"]
-
-                # Zero gradients
-                self.optim.zero_grad()
-
-                # Mixed precision training
-                if self.use_amp:
-                    self.scaler.scale(gc_loss_weighted).backward()
-                    self.scaler.step(self.optim)
-                    self.scaler.update()
-                else:
-                    gc_loss_weighted.backward()
-                    self.optim.step()
-
-                # Update learning rate
-                self.optim_schedule.step()
+                task_losses.append(gc_loss * self.loss_weights["gc"])
             except StopIteration:
-                gc_loss_weighted = 0
+                pass
+            # Compute loss and update
+            batch_loss = sum(task_losses)
 
-            # ====================== Compute total loss ======================
-            # Compute total batch loss (for logging)
-            batch_loss = phase1_loss.item() if task_losses else 0
-            batch_loss += gc_loss_weighted.item() if gc_loss_weighted != 0 else 0
+            # Zero gradients
+            self.optim.zero_grad()
+
+            # Mixed precision training
+            if self.use_amp:
+                self.scaler.scale(batch_loss).backward()
+                self.scaler.step(self.optim)
+                self.scaler.update()
+            else:
+                batch_loss.backward()
+                self.optim.step()
+
+            # Update learning rate
+            self.optim_schedule.step()
 
             # Accumulate loss
             total_loss += batch_loss
@@ -899,7 +877,8 @@ class BERTFinetuneTrainer:
             num_workers=6,
             prefetch_factor=3,
             persistent_workers=True,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=sparse_pair_collate_fn,
         )
 
     def train_epoch(self, epoch, train_loader):
@@ -913,8 +892,9 @@ class BERTFinetuneTrainer:
         )
         
         for i, (a_ids, a_adj, t_ids, t_adj, labels) in enumerate(progress):
-            a_ids, t_ids = a_ids.to(self.device), t_ids.to(self.device)
-            a_adj, t_adj = a_adj.to(self.device), t_adj.to(self.device)
+            if isinstance(a_ids, torch.Tensor) and isinstance(t_ids, torch.Tensor):
+                a_ids, t_ids = a_ids.to(self.device), t_ids.to(self.device)
+                a_adj, t_adj = a_adj.to(self.device), t_adj.to(self.device)
             labels = labels.to(self.device)
             
             with torch.autocast(device_type=self.device, enabled=self.use_amp):

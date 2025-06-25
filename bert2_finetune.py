@@ -63,7 +63,6 @@ if __name__ == "__main__":
         tokenizer=tokenizer,
         seq_len=config.seq_len,
         max_nodes=config.max_nodes,
-        train=True
     )
     
     val_dataset = FunctionPairDataset(
@@ -73,7 +72,6 @@ if __name__ == "__main__":
         tokenizer=tokenizer,
         seq_len=config.seq_len,
         max_nodes=config.max_nodes,
-        train=False
     )
     
     # Initialize model and trainer

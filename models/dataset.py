@@ -57,7 +57,7 @@ class FunctionDataset(Dataset):
 
 # Custom dataset class
 class FunctionPairDataset(Dataset):
-	def __init__(self, function_pool_path, dataset_path, function_idx_mapping_path, tokenizer:AsmTokenizer, seq_len=128, max_nodes=300, train=True):
+	def __init__(self, function_pool_path, dataset_path, function_idx_mapping_path, tokenizer:AsmTokenizer, seq_len=128, max_nodes=300):
 		self.df = pd.read_csv(function_pool_path)
 		self.dataset = load_dataset(
 			"json", 
@@ -71,7 +71,6 @@ class FunctionPairDataset(Dataset):
 		self.tokenizer = tokenizer
 		self.seq_len = seq_len
 		self.max_nodes = max_nodes
-		self.train = train  # Flag to indicate if this is a training dataset
 
 	def __len__(self):
 		return len(self.df)
@@ -216,26 +215,24 @@ class SparseFunctionPairDataset(FunctionPairDataset):
 		t_data = self.dataset[t_idx]
 		
 		# Process the first function (sparse format)
-		a_input_ids, a_adj_indices, a_adj_values = self.process_function(a_data)
+		a_input_ids, a_adj = self.process_function(a_data)
 		
 		# Process the second function (sparse format)
-		t_input_ids, t_adj_indices, t_adj_values = self.process_function(t_data)
+		t_input_ids, t_adj = self.process_function(t_data)
 		
-		label = torch.tensor(row["label"], dtype=torch.float32)
+		label = -1 if int(row["label"]) == 0 else 1  # Convert label to -1 or 1
+		label = torch.tensor(label, dtype=torch.float32)
 		
 		return (
 			a_input_ids, 
-			a_adj_indices, 
-			a_adj_values,
+			a_adj,
 			t_input_ids, 
-			t_adj_indices, 
-			t_adj_values,
+			t_adj,
 			label
 		)
 	def process_function(self, func_data):
 		instr_blocks = func_data["instruction_blocks"]
 		adj_data = func_data["adjacency_matrix"]
-		n_blocks = adj_data["shape"][0]
 		
 		# Create sparse adjacency matrix
 		adj = coo_matrix(
@@ -243,43 +240,24 @@ class SparseFunctionPairDataset(FunctionPairDataset):
 			shape=adj_data["shape"]
 		)
 		
-		return self._process_with_sparse(instr_blocks, adj, n_blocks)
+		return self._process_with_sparse(instr_blocks, adj)
 
-	def _process_with_sparse(self, instr_blocks, adj_matrix, actual_nodes):
+	def _process_with_sparse(self, instr_blocks, adj_matrix):
 		"""Process function and return sparse representation"""
 		processed_blocks = []
 		
 		# 1. Process instruction blocks
-		for i, block in enumerate(instr_blocks):
-			if i >= self.max_nodes:
-				break
-			processed_block = tokenize_and_pad(block, self.tokenizer, self.seq_len)
+		for block in instr_blocks:
+			block = "<CLS> " + block  # Add CLS token
+			ids = self.tokenizer.encode(block)
+			processed_block = pad_sequence(
+				ids=ids,
+				seq_len=self.seq_len,
+				pad_id=self.tokenizer.pad_token_id
+			)
 			processed_blocks.append(torch.tensor(processed_block))
 		
-		if len(processed_blocks) < self.max_nodes:
-			for _ in range(self.max_nodes - len(processed_blocks)):
-				processed_blocks.append(
-					torch.tensor([self.tokenizer.pad_token_id] * self.seq_len)
-				)
 		
 		input_ids = torch.stack(processed_blocks, dim=0)
 		
-		# 2. Process adjacency matrix - sparse representation
-		adj_matrix = adj_matrix.tocoo()
-		rows = adj_matrix.row
-		cols = adj_matrix.col
-		
-		# Filter out indices exceeding max_nodes
-		valid_mask = (rows < self.max_nodes) & (cols < self.max_nodes)
-		rows = rows[valid_mask]
-		cols = cols[valid_mask]
-		data = adj_matrix.data[valid_mask]
-		
-		# Combine indices into a (2, num_edges) numpy array
-		indices = np.vstack((rows, cols))
-		
-		# Convert to tensors
-		indices = torch.tensor(indices, dtype=torch.long)
-		values = torch.tensor(data, dtype=torch.float32)
-		
-		return input_ids, indices, values
+		return input_ids, adj_matrix
