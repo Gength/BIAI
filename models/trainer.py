@@ -67,26 +67,24 @@ class BERTPretrainTrainer:
             self.scaler = torch.amp.GradScaler('cuda')
         print("Total Parameters:", sum([p.nelement() for p in self.model.parameters()]))
         if config.use_wandb:
-            os.environ["WANDB_MODE"] = "online"  # Enable Weights & Biases logging
+            os.environ["WANDB_MODE"] = "offline" # adapt HPC environment
+            wandb.init(
+                project=config.wandb_project, 
+                name=config.wandb_run,
+                config={
+                    "learning_rate": config.lr,
+                    "weight_decay": config.weight_decay,
+                    "batch_size": config.batch_size,
+                    "epochs": self.epochs,
+                    "device": self.device,
+                    "train_sample_ratio": config.train_sample_ratio,
+                    "val_sample_ratio": config.val_sample_ratio,
+                    "total_training_steps": total_steps
+                }
+            )
+            wandb.watch(self.model, log=None)
         else:
-            os.environ["WANDB_MODE"] = "offline"  # Disable Weights & Biases logging
-            # os.environ["WANDB_MODE"] = "disabled"
-        # Initialize wandb
-        wandb.init(
-            project=config.wandb_project, 
-            name=config.wandb_run,
-            config={
-                "learning_rate": config.lr,
-                "weight_decay": config.weight_decay,
-                "batch_size": config.batch_size,
-                "epochs": self.epochs,
-                "device": self.device,
-                "train_sample_ratio": config.train_sample_ratio,
-                "val_sample_ratio": config.val_sample_ratio,
-                "total_training_steps": total_steps
-            }
-        )
-        wandb.watch(self.model, log=None)
+            os.environ["WANDB_MODE"] = "disabled"  # Disable Weights & Biases logging
         os.makedirs(self.model_save_path, exist_ok=True)
         # Create collate functions
         # default train mlm
@@ -524,9 +522,10 @@ class BERTFinetuneTrainer:
             
         # Initialize wandb if enabled
         if config.use_wandb:
-            os.environ["WANDB_MODE"] = "online"
+            os.environ["WANDB_MODE"] = "offline" # adapt HPC environment
             wandb.init(
                 project=config.wandb_project,
+                name=config.wandb_run,
                 config={
                     "batch_size": config.batch_size,
                     "learning_rate": config.lr,
@@ -537,10 +536,9 @@ class BERTFinetuneTrainer:
                     "total_training_steps": total_steps
                 }
             )
-            wandb.run.name = config.wandb_run
             wandb.watch(self.model, log=None)
         else:
-            os.environ["WANDB_MODE"] = "offline"
+            os.environ["WANDB_MODE"] = "disabled"
         
         # Ensure output directory exists
         os.makedirs(config.checkpoint_save_path, exist_ok=True)
