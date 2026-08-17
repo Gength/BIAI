@@ -1,94 +1,109 @@
-import pandas as pd
-import os
-import argparse
-from models.dataset import FunctionPairDataset
-from models.tokenizer import AsmTokenizer
-import torch
-from torch.utils.data import DataLoader
-from models.bert import BERT2, BERT4
-from models.model import CFGFusionModel
-from tqdm import tqdm
-import torch.nn.functional as F
+"""Evaluation of the fine-tuned CFGFusionModel on the cross-platform
+function similarity task (paper task 1): MRR10 and Rank1.
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Command line parameters")
-    parser.add_argument("--device", default="cuda", dest="device")
-    parser.add_argument("--batch_size", type=int, default=20, dest="batch_size")
+Every eligible x64 test function is ranked against all ARM64 functions from
+the same optimization-level test set. All compiler-version variants with the
+same symbol and binary target are relevant answers.
+
+Usage:
+    uv run python bert_caculate_similarity.py [--checkpoint PATH] [--device cuda] [--batch_size 20]
+"""
+import argparse
+import os
+import torch
+from tqdm import tqdm
+
+from models.tokenizer import AsmTokenizer
+from models.bert import BERTForPretraining
+from models.model import CFGFusionModel
+from models.dataset import FunctionPairDataset
+from models.retrieval import (
+    build_retrieval_sets, encode_keys, evaluate_retrieval, load_function_keys,
+)
+from models.trainer import _resolve_device
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate CFGFusionModel (MRR10/Rank1)")
+    parser.add_argument("--pool", default=os.path.join(
+        "outputs", "task1-o2-test-function_pool.csv"),
+        help="test pair pool CSV (e.g. task1-o2-test-function_pool.csv)")
+    parser.add_argument("--checkpoint", default=os.path.join(
+        "outputs", "bert4-finetune-hf", "CFGFusion-best.pth"))
+    parser.add_argument("--pretrained", default=os.path.join(
+        "outputs", "bert4-pretrain-hf", "bert-best"),
+        help="pre-trained BERT checkpoint directory")
+    parser.add_argument("--d_model", type=int, default=128,
+                        help="BERT hidden size (must match the pre-trained model)")
+    parser.add_argument("--mpnn_readout_dim", type=int, default=64)
+    parser.add_argument("--cnn_out", type=int, default=32)
+    parser.add_argument("--hidden_dim", type=int, default=64)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--no_finetune", action="store_true",
+                        help="use the raw pre-trained embeddings without the "
+                             "fine-tuned checkpoint (ablation)")
+    parser.add_argument("--candidate_pool", default=os.path.join(
+        "outputs", "task2-arm64-test-functions.pkl"),
+        help="candidate function list (6-tuple keys)")
+    parser.add_argument("--anchor_pool", default=os.path.join(
+        "outputs", "task2-x64-test-functions.pkl"),
+        help="anchor function list (6-tuple keys)")
     args = parser.parse_args()
-    seq_len = 128
-    tokenizer = AsmTokenizer(
-        vocab_file=os.path.join("outputs", f"baseline-vocab.txt")
-    )
-    function_pool_path = os.path.join("outputs", "test-function_pool.csv")
-    cache_dir = os.path.join("outputs", "cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    # Create datasets
-    test_dataset = FunctionPairDataset(
-        function_pool_path=function_pool_path,
+    device = _resolve_device(args.device)
+
+    tokenizer = AsmTokenizer(vocab_file=os.path.join("outputs", "baseline-vocab.txt"))
+    dataset = FunctionPairDataset(
+        function_pool_path=args.pool,
         dataset_path=os.path.join("outputs", "baseline-test.jsonl"),
-        function_idx_mapping_path=os.path.join("outputs", "test-function-idx-mapping.pkl"),
+        function_idx_mapping_path=os.path.join(
+            "outputs", "test-function-idx-mapping.pkl"),
         tokenizer=tokenizer,
         seq_len=128,
-        train=False
     )
-    test_data_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=4,
-        prefetch_factor=2,  # Prefetch data for faster loading
-        pin_memory=True
-    )
-    model = BERT2(
-        vocab_size=len(tokenizer.vocab),
-        d_model=128,
-        n_layers=12,
-        heads=8,
-        seq_len=seq_len,
-        device=args.device
-    )
-    model.load_state_dict(
-        torch.load(
-            os.path.join("outputs", "bert2-improved-pretrain-lrscheduler", "bert2-best.pth")
-        )
-    )
-    model = model.to(args.device)
+
+    bert = BERTForPretraining.from_pretrained(args.pretrained, device=device)
+    model = CFGFusionModel(bert, d_model=args.d_model,
+                           mpnn_readout_dim=args.mpnn_readout_dim,
+                           cnn_out=args.cnn_out,
+                           hidden_dim=args.hidden_dim).to(device)
+    if not args.no_finetune:
+        model.load_state_dict(torch.load(args.checkpoint, map_location=device,
+                                         weights_only=True))
     model.eval()
-    correct = 0
-    total = 0
-    predictions_collect = []
-    output_csv_path = os.path.join("outputs", f"baseline-results.csv")
-    progress_bar = tqdm(total=len(test_data_loader), desc="Testing", unit="batch")
-    with torch.no_grad():
-        for a_ids, a_adj, t_ids, t_adj, labels in test_data_loader:
-            a_ids = a_ids.to(args.device)
-            t_ids = t_ids.to(args.device)
-            labels = labels.to(torch.int)
-            a_flatten = a_ids.view(-1, seq_len)
-            t_flatten = t_ids.view(-1, seq_len)
-            a_block_embeddings = model.encode(a_flatten)
-            t_block_embeddings = model.encode(t_flatten)
-            a_node_features = a_block_embeddings.view(a_ids.size(0), -1, 128)
-            t_node_features = t_block_embeddings.view(t_ids.size(0), -1, 128)
-            cosine_sim = F.cosine_similarity(torch.sum(a_node_features, dim=1),torch.sum(t_node_features, dim=1), dim=1)
-            # add sigmoid activation for binary classification
-            predictions = (cosine_sim > 0).to(torch.int).cpu()
-            predictions[predictions == 0] = -1
-            predictions_collect.extend(predictions.cpu().int().numpy().tolist())
-            correct += (predictions == labels).sum().item()
-            total += labels.size(0)
+    if args.no_finetune:
+        print("Using raw pre-trained embeddings (no fine-tuning)")
+    else:
+        print(f"Loaded checkpoint from {args.checkpoint}")
 
-            current_accuracy = correct / total
-            progress_bar.set_postfix({"accuracy": f"{current_accuracy:.4f}"})
-            progress_bar.update(1)
-    progress_bar.close()
-    accuracy = correct / total
-    print(f"Final Accuracy: {accuracy:.4f}")
-    # Save predictions to CSV
-    function_pool = pd.read_csv(function_pool_path)
-    function_pool['label'] = function_pool['label'].astype(int)
-    function_pool[function_pool['label'] == 0] = -1 
-    function_pool["prediction"] = predictions_collect
-    function_pool.to_csv(output_csv_path, index=False)
-    print(f"Predictions saved to {output_csv_path}")
+    opt_level = None
+    for token in ("task1-o2", "task1-o3"):
+        if token in args.pool:
+            opt_level = token.replace("task1-", "").upper()
+            break
+    evaluate_full_pool(
+        model, dataset, device, args.anchor_pool, args.candidate_pool, opt_level)
 
+
+def evaluate_full_pool(model, dataset, device, anchor_pool_path,
+                       candidate_pool_path, opt_level=None):
+    """Paper-style retrieval: rank each x64 anchor against ALL arm64 test
+    functions by cosine similarity of graph embeddings."""
+    anchor_keys = load_function_keys(anchor_pool_path)
+    candidate_keys = load_function_keys(candidate_pool_path)
+    retrieval, cand_keys = build_retrieval_sets(
+        anchor_keys, candidate_keys, opt_level)
+    print(f"Candidate pool: {len(cand_keys)} ({opt_level or 'all opts'}) ARM64 functions")
+    print(f"Eligible anchors: {len(retrieval)}")
+
+    metrics = evaluate_retrieval(
+        model, dataset, device, anchor_keys, candidate_keys, opt_level,
+        progress=lambda items: tqdm(items, desc="Ranking anchors (full pool)"),
+    )
+    print(f"\n[full pool] Test anchors: {metrics['anchors']}")
+    print(f"[full pool] MRR10: {metrics['mrr10']:.4f}")
+    print(f"[full pool] Rank1: {metrics['rank1']:.4f}")
+
+
+
+if __name__ == "__main__":
+    main()

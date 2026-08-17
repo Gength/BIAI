@@ -1,213 +1,281 @@
+"""Dataset preparation following the Order-Matters paper (Table 1).
+
+Data: gcc-compiled binaries from Dataset-1, architectures {x64, arm64},
+optimization levels {O0, O1, O2, O3} (paper Task 2 uses O0-O3; Task 1 uses
+O2/O3 cross-platform pairs). Os and clang are excluded, matching the paper
+("we choose x86-64 and ARM as the two platforms, and compile on gcc").
+
+Outputs (in ./outputs):
+- baseline-{train,val,test}.jsonl      : all functions (pretraining + finetune)
+- {split}-function-idx-mapping.pkl     : key -> line number
+- task1-o{2,3}-{split}-function_pool.csv : cross-platform (x64<->arm64)
+                                          same-function pairs, label 1/0
+- task2-{x64,arm64}-{split}-functions.pkl : function lists for O0-O3
+                                          classification (paper reports the
+                                          two platforms separately)
+- baseline-vocab.txt                   : token vocab (built from the JSONL)
+"""
 import os
 import re
-import pickle
-import pandas as pd
-from collections import defaultdict
-from sklearn.model_selection import train_test_split
-from models.tokenizer import AsmTokenizer
-from itertools import combinations
-import random
-BASELINE_DIR = os.path.join('.','baseline')
-OUTPUT_DIR = os.path.join('.','outputs')
-
-def split_functions():
-    # Step 1: recursively collect all pkl files from subfolders
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    pkl_files = []
-
-    for file in os.listdir(BASELINE_DIR):
-        if file.endswith(".pkl") and file.startswith("output_"):
-            pkl_files.append(os.path.join(BASELINE_DIR, file))
-
-    # Step 2: extract meta info (project, compiler, version, opt level) from file name
-
-    def parse_bin_info(file_path):
-        file_name = os.path.basename(file_path).replace("output_", "").replace(".pkl", "")
-        parts = re.split(r"[-_]", file_name)
-        bin_name = parts[-1]
-        compiler = next((c for c in ["gcc", "clang"] if c in parts), "unknown")
-        version = next((v for v in parts if re.match(r"\d+(\.\d+)?", v)), "unknown")
-        opt = next((o for o in ["O0", "O1", "O2", "O3", "Os"] if o in parts), "unknown")
-        return compiler, str(float(version)), opt, file_name
-
-    function_list = []
-
-    # Step 3: iterate over all pkl files and gather function info
-    for file_path in pkl_files:
-        try:
-            with open(file_path, "rb") as f:
-                data = pickle.load(f)
-        except:
-            continue
-        compiler, version, opt, file_name = parse_bin_info(file_path)
-        for func_name in data.keys():
-            entry = (func_name, compiler, version, opt, file_name)
-            function_list.append(entry)
-
-    # Step 4: split into train/val/test (function-level split)
-    train_val, test = train_test_split(function_list, test_size=0.1, random_state=42)
-    train, val = train_test_split(train_val, test_size=0.3, random_state=42)
-
-
-    for split, data in zip(["train", "val", "test"], [train, val, test]):
-        with open(os.path.join(OUTPUT_DIR, f"baseline-{split}-functions.pkl"), "wb") as f:
-            pickle.dump(data, f)
-
-    # Step 6: generate similarity pairs and labels
-    for split, functions in zip(["train", "val", "test"], [train, val, test]):
-        pairs = []
-        # Convert test set to list of dicts for easier handling
-        function_dicts = [
-            {
-                "function_name": fn,
-                "compiler": comp,
-                "version": ver,
-                "opt": opt,
-                "file_name": file_name
-            }
-            for fn, comp, ver, opt, file_name in functions
-        ]
-        # Group by (function_name)
-        grouped = defaultdict(list)
-        for item in function_dicts:
-            grouped[item["function_name"]].append(item)
-        # delete items with less than 2 functions
-        grouped = {k: v for k, v in grouped.items() if len(v) >= 2}
-
-        for a_func, a_group in grouped.items():
-            # Generate positive pairs: all pairs within the group
-            positive_pairs = []
-            negative_pairs = []
-            for a, b in combinations(a_group, 2):
-                positive_pairs.append({
-                    "anchor_function_file": a["file_name"],
-                    "anchor_function_name": a["function_name"],
-                    "anchor_compiler": a["compiler"],
-                    "anchor_version": a["version"],
-                    "anchor_opt": a["opt"],
-                    "target_function_file": b["file_name"],
-                    "target_function_name": b["function_name"],
-                    "target_compiler": b["compiler"],
-                    "target_version": b["version"],
-                    "target_opt": b["opt"],
-                    "label": 1  # Positive pair
-                })
-            # Randomly sample positive pairs to limit the number
-            # of pairs per function to 5
-            if split == "train":
-                sample_counts = 5
-            elif split == "val":
-                sample_counts = 2
-            else:  # test
-                sample_counts = 3
-            sampled_positive_pairs = random.sample(positive_pairs, min(len(positive_pairs), sample_counts))
-            pairs.extend(sampled_positive_pairs)
-            # Generate negative pairs: randomly pick one from this group, one from each other group
-            b_funcs = [k for k in grouped.keys() if k != a_func]
-            random.shuffle(b_funcs)  # Shuffle to ensure randomness
-            while len(b_funcs) > 0 and len(negative_pairs) < len(sampled_positive_pairs):
-                a_idx = random.randint(0, len(a_group) - 1)
-                a = a_group[a_idx]
-                b_func = b_funcs.pop()
-                b_group = grouped[b_func]
-                b_idx = random.randint(0, len(b_group) - 1)
-                b = b_group[b_idx]
-                negative_pairs.append({
-                    "anchor_function_file": a["file_name"],
-                    "anchor_function_name": a["function_name"],
-                    "anchor_compiler": a["compiler"],
-                    "anchor_version": a["version"],
-                    "anchor_opt": a["opt"],
-                    "target_function_file": b["file_name"],
-                    "target_function_name": b["function_name"],
-                    "target_compiler": b["compiler"],
-                    "target_version": b["version"],
-                    "target_opt": b["opt"],
-                    "label": 0  # Negative pair
-                })
-            pairs.extend(negative_pairs)
-
-        # Step 7: save CSV
-        pd.DataFrame(pairs).to_csv(os.path.join(OUTPUT_DIR, f"{split}-function_pool.csv"), index=False)
-
 import json
-# Define the function to process a single split
-def process_split_datasets(split):
+import pickle
+import random
+from collections import defaultdict
 
-    function_name_idx_map = {}
-    count = 0
-    output_path = os.path.join(OUTPUT_DIR, f"baseline-{split}.jsonl")
-    if(os.path.exists(output_path)):
-        os.remove(output_path)
-    with open(os.path.join(OUTPUT_DIR, f"baseline-{split}-functions.pkl"), "rb") as f:
-        data = pickle.load(f)
-    df = pd.DataFrame(data, columns=['function_name', 'compiler', 'version', 'opt', 'file_name'])
-    for file_name, group in df.groupby('file_name'):
-        load_path = os.path.join(BASELINE_DIR, 'output_'+file_name+'.pkl')
-        with open(load_path, "rb") as f:
-            binary_data = pickle.load(f)
-        
-        with open(output_path, 'a', encoding='utf-8') as out_file:
-            for row in group.itertuples(index=False):
-                function_name = row.function_name
-                compiler = row.compiler
-                version = row.version
-                opt = row.opt
-                function_data = binary_data[function_name]
-                addr_to_idx = function_data['addr_to_idx']
-                output_obj = {}
-                # Only keep keys of integer type
-                block_addr = [k for k in addr_to_idx.keys()]
-                block_addr = sorted(block_addr, key=lambda x: addr_to_idx[x])
-                instruction_blocks = []
-                for instr_key in block_addr:
-                    block = function_data[instr_key]
-                    instructions = " ".join(block)
-                    instruction_blocks.append(instructions)
-                output_obj['instruction_blocks'] = instruction_blocks
-                
-                adj = function_data['adjacency_matrix']
-                output_obj['adjacency_matrix'] = {
-                    'row': adj.row.tolist(),
-                    'col': adj.col.tolist(),
-                    'data': adj.data.tolist(),
-                    'shape': adj.shape
-                }
+import pandas as pd
+from sklearn.model_selection import train_test_split
 
-                key = (function_name, compiler, version, opt, file_name)
-                function_name_idx_map[key] = count
-                count += 1
-                out_file.write(json.dumps(output_obj, ensure_ascii=False) + '\n')
+from models.tokenizer import AsmTokenizer
 
-    with open(os.path.join(OUTPUT_DIR, f"{split}-function-idx-mapping.pkl"), "wb") as f:
-        pickle.dump(function_name_idx_map, f)
+BASELINE_DIR = os.path.join(".", "baseline")
+OUTPUT_DIR = os.path.join(".", "outputs")
+DATASET_DIR = os.path.join(".", "data", "Dataset-1")
 
-from multiprocessing import Process
-if __name__ == '__main__':
-    # Split into three datasets based on project and function name
-    split_functions()
-    # Create three processes to generate datasets separately
-    splits = ["train", "val", "test"]
-    processes = []
-    
-    for split in splits:
-        p = Process(target=process_split_datasets, args=(split,))
-        processes.append(p)
-        p.start()
-    
-    # synchronize processes
-    for p in processes:
-        p.join()
-    
-    # build vocab
-    vocab = {"<PAD>": 0, "<CLS>": 1, "<SEP>": 2, "<MASK>": 3, "<UNK>": 4, "<const>": 5}
+ARCHS = ["x64", "arm64"]
+OPTS = ["O0", "O1", "O2", "O3"]
+
+
+def binary_target(file_name):
+    """Executable/library identity after the compiler metadata prefix."""
+    if "_" not in file_name:
+        raise ValueError(f"unexpected Dataset-1 binary name: {file_name!r}")
+    return file_name.split("_", 1)[1]
+
+
+def build_binary_project_map(dataset_dir=DATASET_DIR):
+    """Map each flattened binary name back to its source project directory."""
+    mapping = {}
+    for project in sorted(os.listdir(dataset_dir)):
+        project_dir = os.path.join(dataset_dir, project)
+        if not os.path.isdir(project_dir) or project == "z3":
+            continue
+        for binary_name in sorted(os.listdir(project_dir)):
+            previous = mapping.get(binary_name)
+            if previous is not None and previous != project:
+                raise ValueError(
+                    f"binary name {binary_name!r} occurs in both "
+                    f"{previous!r} and {project!r}; flattened baseline names "
+                    "are ambiguous"
+                )
+            mapping[binary_name] = project
+    return mapping
+
+
+def parse_bin_info(file_name, project=None):
+    """Extract (project, compiler, version, opt, arch, file_name) from a pkl name."""
+    parts = re.split(r"[-_]", file_name)
+    project = project or parts[-1]
+    compiler = next((c for c in ["gcc", "clang"] if c in parts), "unknown")
+    raw_version = next((v for v in parts if re.fullmatch(r"\d+(\.\d+)?", v)), None)
+    version = str(float(raw_version)) if raw_version is not None else "unknown"
+    opt = next((o for o in ["O0", "O1", "O2", "O3", "Os"] if o in parts), "unknown")
+    arch = next((a for a in ["x86", "x64", "arm32", "arm64", "mips32", "mips64"]
+                 if a in parts), "unknown")
+    return project, compiler, version, opt, arch, file_name
+
+
+def collect_functions():
+    """Collect all functions with their (project, compiler, version, opt, arch)."""
+    project_by_binary = build_binary_project_map()
+    function_list = []  # (function_name, project, compiler, version, opt, arch, file_name)
+    for f in sorted(os.listdir(BASELINE_DIR)):
+        if not (f.endswith(".pkl") and f.startswith("output_")):
+            continue
+        file_name = f.replace("output_", "").replace(".pkl", "")
+        if file_name not in project_by_binary:
+            raise ValueError(f"cannot resolve source project for {file_name!r}")
+        project, compiler, version, opt, arch, _ = parse_bin_info(
+            file_name, project=project_by_binary[file_name])
+        if compiler != "gcc" or arch not in ARCHS or opt not in OPTS:
+            continue  # paper: gcc, x86-64/ARM, O0-O3
+        try:
+            with open(os.path.join(BASELINE_DIR, f), "rb") as fh:
+                data = pickle.load(fh)
+        except Exception:
+            continue
+        for func_name in sorted(data.keys()):
+            function_list.append((func_name, project, compiler, version, opt,
+                                  arch, file_name))
+    return function_list
+
+
+def group_split(functions, test_size=0.1, val_size=0.1, seed=42):
+    """Group-level split: same-source functions (same project+name) stay together."""
+    groups = defaultdict(list)
+    for fn in functions:
+        groups[(fn[0], fn[1])].append(fn)  # (function_name, project)
+
+    group_keys = sorted(groups.keys())
+    random.seed(seed)
+    train_val, test = train_test_split(group_keys, test_size=test_size,
+                                       random_state=seed)
+    train, val = train_test_split(train_val, test_size=val_size / (1 - test_size),
+                                  random_state=seed)
+    splits = {"train": [], "val": [], "test": []}
+    for split, keys in zip(splits, [train, val, test]):
+        for k in keys:
+            splits[split].extend(groups[k])
+    return splits
+
+
+def generate_jsonl(splits):
+    """Write per-function JSONL + idx mapping for all three splits."""
+    for split, functions in splits.items():
+        function_name_idx_map = {}
+        count = 0
+        output_path = os.path.join(OUTPUT_DIR, f"baseline-{split}.jsonl")
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        # Group by file to load each pkl once.
+        by_file = defaultdict(list)
+        for fn in functions:
+            by_file[fn[6]].append(fn)
+        with open(output_path, "a", encoding="utf-8") as out_file:
+            for file_name, funcs in by_file.items():
+                with open(os.path.join(BASELINE_DIR, f"output_{file_name}.pkl"),
+                          "rb") as fh:
+                    binary_data = pickle.load(fh)
+                for (func_name, project, compiler, version, opt, arch,
+                     fname) in funcs:
+                    function_data = binary_data[func_name]
+                    addr_to_idx = function_data["addr_to_idx"]
+                    block_addr = sorted(addr_to_idx, key=addr_to_idx.get)
+                    instruction_blocks = [
+                        " ".join(function_data[a]) for a in block_addr
+                    ]
+                    adj = function_data["adjacency_matrix"]
+                    output_obj = {
+                        "instruction_blocks": instruction_blocks,
+                        "adjacency_matrix": {
+                            "row": adj.row.tolist(),
+                            "col": adj.col.tolist(),
+                            "data": adj.data.tolist(),
+                            "shape": adj.shape,
+                        },
+                        "opt": opt,
+                        "arch": arch,
+                    }
+                    key = (func_name, compiler, version, opt, arch, file_name)
+                    function_name_idx_map[key] = count
+                    count += 1
+                    out_file.write(json.dumps(output_obj) + "\n")
+        with open(os.path.join(OUTPUT_DIR,
+                               f"{split}-function-idx-mapping.pkl"), "wb") as fh:
+            pickle.dump(function_name_idx_map, fh)
+        print(f"{split}: {count} functions -> {output_path}")
+
+
+def generate_task1_pools(splits, seed=42):
+    """Task 1: cross-platform (x64 <-> arm64) same-function pairs, per opt."""
+    rng = random.Random(seed)
+    for opt_level in ["O2", "O3"]:
+        for split, functions in splits.items():
+            # anchor = x64, target = arm64 (same function name & project, same opt)
+            by_name = defaultdict(lambda: {"x64": [], "arm64": []})
+            for (func_name, project, compiler, version, opt, arch,
+                 file_name) in functions:
+                if opt == opt_level:
+                    # A symbol such as `main` can refer to unrelated source in
+                    # two executables from the same top-level project. Pair
+                    # only matching symbol + binary target; compiler versions
+                    # and architectures remain the varying dimensions.
+                    by_name[(func_name, binary_target(file_name))][arch].append(
+                        (version, file_name))
+            pairs = []
+            for (func_name, target_name), groups in by_name.items():
+                x64_list, arm64_list = groups["x64"], groups["arm64"]
+                if not x64_list or not arm64_list:
+                    continue
+                # Positive pairs: every x64/ARM64 compiler-version combination
+                # compiled from the same symbol in the same binary target.
+                pos = []
+                for a in x64_list:
+                    for b in arm64_list:
+                        pos.append((a, b))
+                for (a_ver, a_file), (b_ver, b_file) in pos:
+                    pairs.append({
+                        "anchor_function_file": a_file,
+                        "anchor_function_name": func_name,
+                        "anchor_compiler": "gcc", "anchor_version": a_ver,
+                        "anchor_opt": opt_level, "anchor_arch": "x64",
+                        "target_function_file": b_file,
+                        "target_function_name": func_name,
+                        "target_compiler": "gcc", "target_version": b_ver,
+                        "target_opt": opt_level, "target_arch": "arm64",
+                        "label": 1,
+                    })
+                # Negative pairs: random different-name functions.
+                neg_pool = [
+                    k for k, value in by_name.items()
+                    if k != (func_name, target_name) and value["arm64"]
+                ]
+                rng.shuffle(neg_pool)
+                n_neg = min(len(pos), len(neg_pool))
+                for i in range(n_neg):
+                    other = by_name[neg_pool[i]]
+                    if not other["arm64"]:
+                        continue
+                    a = rng.choice(x64_list)
+                    b = rng.choice(other["arm64"])
+                    pairs.append({
+                        "anchor_function_file": a[1],
+                        "anchor_function_name": func_name,
+                        "anchor_compiler": "gcc", "anchor_version": a[0],
+                        "anchor_opt": opt_level, "anchor_arch": "x64",
+                        "target_function_file": b[1],
+                        "target_function_name": neg_pool[i][0],
+                        "target_compiler": "gcc", "target_version": b[0],
+                        "target_opt": opt_level, "target_arch": "arm64",
+                        "label": 0,
+                    })
+            pd.DataFrame(pairs).to_csv(
+                os.path.join(OUTPUT_DIR,
+                             f"task1-{opt_level.lower()}-{split}-function_pool.csv"),
+                index=False)
+            print(f"task1-{opt_level.lower()}-{split}: {len(pairs)} pairs")
+
+
+def generate_task2_splits(splits):
+    """Task 2: per-platform function lists for O0-O3 classification."""
+    for arch in ARCHS:
+        for split, functions in splits.items():
+            # 6-tuple keys, matching the JSONL idx mapping (no project).
+            funcs = [(fn, cv, v, o, ar, fname)
+                     for (fn, pr, cv, v, o, ar, fname) in functions
+                     if ar == arch]
+            with open(os.path.join(OUTPUT_DIR,
+                                   f"task2-{arch}-{split}-functions.pkl"),
+                      "wb") as fh:
+                pickle.dump(funcs, fh)
+            print(f"task2-{arch}-{split}: {len(funcs)} functions")
+
+
+def build_vocab():
+    """Build the token vocab from the train split JSONL."""
     from datasets import load_dataset
-    tokenizer = AsmTokenizer(vocab_file=os.path.join(OUTPUT_DIR, "baseline-vocab.txt"))
-    tokenizer.vocab = vocab  # Use the predefined vocab
-    for dataset_name in ["baseline-train", "baseline-val", "baseline-test"]:
-        dataset_path = os.path.join(".", "outputs", f"{dataset_name}.jsonl")
-        dataset = load_dataset('json', data_files=dataset_path, split="train", streaming=True)
-        for data in dataset:
-                tokenizer.build_vocab(data['instruction_blocks'])
-    # Save vocab to file
+    tokenizer = AsmTokenizer()  # starts from the base special-token vocab
+    dataset = load_dataset(
+        "json",
+        data_files=os.path.join(OUTPUT_DIR, "baseline-train.jsonl"),
+        split="train",
+        streaming=True,
+    )
+    for data in dataset:
+        tokenizer.build_vocab(data["instruction_blocks"])
     tokenizer.save_vocab(os.path.join(OUTPUT_DIR, "baseline-vocab.txt"))
+    print(f"Vocab size: {len(tokenizer.vocab)}")
+
+
+if __name__ == "__main__":
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(os.path.join(OUTPUT_DIR, "binary-project-map.json"),
+              "w", encoding="utf-8") as fh:
+        json.dump(build_binary_project_map(), fh, indent=2, sort_keys=True)
+    functions = collect_functions()
+    print(f"Collected {len(functions)} functions "
+          f"({len(set((f[0], f[1]) for f in functions))} same-source groups)")
+    splits = group_split(functions)
+    generate_jsonl(splits)
+    generate_task1_pools(splits)
+    generate_task2_splits(splits)
+    build_vocab()

@@ -1,86 +1,112 @@
-import torch
+"""Fine-tuning of CFGFusionModel (BERT + MPNN + ResNet11) with a siamese
+network and cosine embedding loss, on the cross-platform function
+similarity task (paper task 1).
+
+Usage:
+    uv run python bert4_finetune.py
+"""
 import os
-from models.bert import BERT4
-from models.model import CFGFusionModel
+import argparse
+
 from models.tokenizer import AsmTokenizer
+from models.bert import BERTForPretraining
+from models.checkpoint_utils import backup_existing, clear_completion_marker
+from models.model import CFGFusionModel
 from models.dataset import FunctionPairDataset
 from models.trainer import BERTFinetuneTrainer
-from models.dataset import opt_arch_combinations
 
-# Configuration parameters with sampling ratios
+
 class Config:
-    batch_size = 7  # A40: 7
-    max_nodes = 200  # Maximum number of basic blocks
-    seq_len = 128    # Maximum sequence length
-    hidden_dim = 64  # Graph embedding dimension
-    lr = 1e-4
+    # --- data ---
+    vocab_file = os.path.join("outputs", "baseline-vocab.txt")
+    train_pool = None   # set from --task1_opt
+    train_jsonl = os.path.join("outputs", "baseline-train.jsonl")
+    train_mapping = os.path.join("outputs", "train-function-idx-mapping.pkl")
+    val_pool = None     # set from --task1_opt
+    val_jsonl = os.path.join("outputs", "baseline-val.jsonl")
+    val_mapping = os.path.join("outputs", "val-function-idx-mapping.pkl")
+
+    # --- model ---
+    seq_len = 128
+    d_model = 128
+    mpnn_readout_dim = 64
+    cnn_out = 32
+    graph_hidden_dim = 64
+
+    # --- training ---
+    batch_size = 5
+    grad_accum = 2            # effective batch = 10 (paper setting) via accumulation
+    epochs = 15
+    lr = 1e-4                # paper: Adam, lr 1e-4
+    weight_decay = 0.0         # paper specifies Adam, with no weight decay
     betas = (0.9, 0.999)
-    weight_decay = 0.01
-    epochs = 10
-    device = "cuda"
-    bert_checkpoint = os.path.join("outputs", "bert4-improved-pretrain-equal-weight-lrscheduler", "bert4"
-    "-best.pth")  # Pretrained BERT path
-    checkpoint_save_path = os.path.join("outputs", "bert4-finetune")  # Checkpoint save path
-    use_amp = True  # Use Automatic Mixed Precision (AMP) if available
-    use_wandb = True  # Use Weights & Biases for logging
-    wandb_run = "bert4-finetune"  # Weights & Biases run name
-    wandb_project = "bert4-training"  # Weights & Biases project name
-    log_freq = 10  
-    train_sample_ratio = 0.2  # 20% training set sampling ratio
-    val_sample_ratio = 0.2    # 20% validation set sampling ratio
+    margin = 0.0
+    seed = 42
+    num_workers = 2            # 2 workers 并行 tokenize（4 个会爆 15GB RAM）；内存 ~7GB 安全
+    prefetch_factor = 4
+
+    # --- misc ---
+    device = "cuda"          # falls back to CPU automatically
+    use_amp = True
+    pretrained_path = os.path.join("outputs", "bert4-pretrain-hf", "bert-best")
+    checkpoint_save_path = os.path.join("outputs", "bert4-finetune-hf")
+
 
 if __name__ == "__main__":
-    def init_model(vocab_size):
-        # Load pretrained BERT
-        bert_model = BERT4(
-            vocab_size=vocab_size,
-            num_classes=len(opt_arch_combinations),
-            d_model=128,
-            n_layers=12,
-            heads=8,
-            seq_len=config.seq_len,
-            device=config.device
-        )
-        bert_model.load_state_dict(torch.load(config.bert_checkpoint))
-        
-        # Create semantic-aware model
-        cfg_fusion_model = CFGFusionModel(
-            bert_model=bert_model,
-            d_model=128,
-            hidden_dim=config.hidden_dim,
-            device=config.device
-        ).to(config.device)
-        return cfg_fusion_model
+    parser = argparse.ArgumentParser(description="Task1 siamese fine-tuning")
+    parser.add_argument("--task1_opt", choices=["o2", "o3"], default="o2",
+                        help="paper Task 1 dataset: gcc-O2 or gcc-O3")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="override the Config epochs (for ablations)")
+    args = parser.parse_args()
+
     config = Config()
-    # Initialize tokenizer to get vocab size
-    tokenizer = AsmTokenizer(vocab_file="outputs/baseline-vocab.txt")
-    vocab_size = len(tokenizer.vocab)
-    
-    # Create datasets
+    if args.epochs is not None:
+        config.epochs = args.epochs
+    config.train_pool = os.path.join(
+        "outputs", f"task1-{args.task1_opt}-train-function_pool.csv")
+    config.val_pool = os.path.join(
+        "outputs", f"task1-{args.task1_opt}-val-function_pool.csv")
+    config.task1_opt = args.task1_opt
+    config.val_anchor_pool = os.path.join(
+        "outputs", "task2-x64-val-functions.pkl")
+    config.val_candidate_pool = os.path.join(
+        "outputs", "task2-arm64-val-functions.pkl")
+    config.checkpoint_save_path = os.path.join(
+        "outputs", f"bert4-finetune-hf-{args.task1_opt}")
+
+    tokenizer = AsmTokenizer(vocab_file=config.vocab_file)
+    print(f"Vocab size: {len(tokenizer.vocab)}")
+
     train_dataset = FunctionPairDataset(
-        function_pool_path=os.path.join("outputs", "train-function_pool.csv"),
-        dataset_path=os.path.join("outputs", "baseline-train.jsonl"),
-        function_idx_mapping_path=os.path.join("outputs", "train-function-idx-mapping.pkl"),
+        function_pool_path=config.train_pool,
+        dataset_path=config.train_jsonl,
+        function_idx_mapping_path=config.train_mapping,
         tokenizer=tokenizer,
         seq_len=config.seq_len,
-        max_nodes=config.max_nodes,
     )
-    
     val_dataset = FunctionPairDataset(
-        function_pool_path=os.path.join("outputs", "val-function_pool.csv"),
-        dataset_path=os.path.join("outputs", "baseline-val.jsonl"),
-        function_idx_mapping_path=os.path.join("outputs", "val-function-idx-mapping.pkl"),
+        function_pool_path=config.val_pool,
+        dataset_path=config.val_jsonl,
+        function_idx_mapping_path=config.val_mapping,
         tokenizer=tokenizer,
         seq_len=config.seq_len,
-        max_nodes=config.max_nodes,
     )
-    
-    # Initialize model and trainer
-    model = init_model(vocab_size)
-    trainer = BERTFinetuneTrainer(
-        model=model,
-        train_dataset=train_dataset,  # Pass full training dataset
-        val_dataset=val_dataset,      # Pass full validation dataset
-        config=config
+    print(f"Train pairs: {len(train_dataset)}, Val pairs: {len(val_dataset)}")
+
+    bert = BERTForPretraining.from_pretrained(config.pretrained_path)
+    model = CFGFusionModel(
+        bert,
+        d_model=config.d_model,
+        mpnn_readout_dim=config.mpnn_readout_dim,
+        cnn_out=config.cnn_out,
+        hidden_dim=config.graph_hidden_dim,
     )
-    trainer.train()
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    backup_existing(os.path.join(
+        config.checkpoint_save_path, "CFGFusion-best.pth"))
+    clear_completion_marker(os.path.join(
+        config.checkpoint_save_path, "train-done.json"))
+    trainer = BERTFinetuneTrainer(model, config)
+    trainer.train(train_dataset, val_dataset)

@@ -12,3 +12,7 @@ slurm/
 *sh.o*
 *.out
 *.err
+
+.venv/
+.reasonix/
+ocr/

@@ -1,744 +1,500 @@
+"""Trainers for BERT pre-training (4 tasks) and siamese fine-tuning.
+
+Pre-training: fixed learning rate 1e-4 (paper setting), optional linear
+warmup + cosine decay, AMP on CUDA, wandb optional.
+Fine-tuning: siamese CosineEmbeddingLoss (paper task 1 setup).
+"""
+import math
 import os
 import random
-import math
+import json
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-from torch.optim import Adam
-from models.collatefn import MLMCollateFn, ANPCollateFn, BIGCollateFn, GCCollateFn, CombinedCollateFn, sparse_pair_collate_fn
-import wandb
-import tqdm
-from models.dataset import TaskDataset
-from torch.utils.data import Subset
 import torch.nn.functional as F
-from models.model import CFGFusionModel
-from models.bert import BERT, BERT2, BERT4
+from torch.utils.data import DataLoader, Subset
+from transformers.optimization import get_linear_schedule_with_warmup
+
+from models.collatefn import (
+    MLMCollateFn, ANPCollateFn, BIGCollateFn, GCCollateFn,
+    CombinedCollateFn, sparse_pair_collate_fn,
+)
+from models.dataset import TaskDataset
+from models.retrieval import evaluate_retrieval, load_function_keys
+
+
+def _resolve_device(device):
+    if device is None:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if isinstance(device, torch.device):
+        return device
+    dev = torch.device(device)
+    if dev.type == "cuda" and not torch.cuda.is_available():
+        print(f"[trainer] CUDA requested but unavailable, falling back to CPU")
+        return torch.device("cpu")
+    return dev
+
+
+class BucketBatchSampler:
+    """Group samples by graph size for stable native-graph memory usage.
+
+    Samples are bucketed by log-size; each batch is drawn from one bucket.
+    """
+
+    def __init__(self, sizes, batch_size, shuffle=True, num_buckets=8, seed=42):
+        import math
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.rng = random.Random(seed)
+        # Bucket id = floor(log2(max(1, size))), capped at num_buckets-1
+        max_log = max(1, int(math.log2(max(1, max(sizes)))))
+        buckets = {}
+        for i, s in enumerate(sizes):
+            bid = min(int(math.log2(max(1, s))), num_buckets - 1)
+            buckets.setdefault(bid, []).append(i)
+        self.buckets = [buckets.get(b, []) for b in range(num_buckets)]
+        self._len = sum(
+            max(1, len(b) // batch_size + (1 if len(b) % batch_size else 0))
+            for b in self.buckets if b
+        )
+
+    def __iter__(self):
+        batches = []
+        for bucket in self.buckets:
+            if not bucket:
+                continue
+            order = list(bucket)
+            if self.shuffle:
+                self.rng.shuffle(order)
+            for i in range(0, len(order), self.batch_size):
+                batches.append(order[i:i + self.batch_size])
+        if self.shuffle:
+            self.rng.shuffle(batches)
+        return iter(batches)
+
+    def __len__(self):
+        return self._len
+
+
 class BERTPretrainTrainer:
-    def __init__(
-        self,
-        model: BERT| BERT2| BERT4,
-        train_dataset,  # Full training dataset
-        valid_dataset,  # Full validation dataset
-        tokenizer,
-        config
-    ):
+    """Train `BERTForPretraining` on the four tasks (MLM/ANP/BIG/GC)."""
+
+    def __init__(self, model, tokenizer, config):
         self.config = config
-        self.device = config.device
+        self.device = _resolve_device(config.device)
         self.model = model.to(self.device)
-        self.full_train_dataset = train_dataset  # Save full training dataset
-        self.full_valid_dataset = valid_dataset  # Save full validation dataset
         self.tokenizer = tokenizer
-        
-        # Sampling seed
-        self.sample_seed = 42
-        
-        # Initialize sampling state
-        self.train_sampled_indices = set()
-        self.train_unsampled_indices = set(range(len(train_dataset)))
-        self.valid_sampled_indices = set()
-        self.valid_unsampled_indices = set(range(len(valid_dataset)))
-        
-        # Single optimizer for the whole model
-        self.optim = Adam(
-            self.model.parameters(), lr=config.lr , betas=config.betas, weight_decay=config.weight_decay
-        )
-        
-        # Calculate total number of iterations
-        train_samples_per_epoch = int(len(train_dataset) * config.train_sample_ratio)
-        steps_per_epoch = math.ceil(train_samples_per_epoch / config.batch_size)
-        total_steps = steps_per_epoch * config.epochs
-        # Single learning rate scheduler
-        self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
-            self.optim,
-            max_lr=1e-3,
-            total_steps=total_steps,
-            pct_start=0.3,
-            anneal_strategy="cos",
-            final_div_factor=1e2,
-        )
 
-        self.log_freq = config.log_freq
-        self.best_loss = float('inf')
-        self.model_save_path = config.checkpoint_save_path
-        self.epochs = config.epochs
-        self.use_amp = config.use_amp
-        if self.use_amp:
-            self.scaler = torch.amp.GradScaler('cuda')
-        print("Total Parameters:", sum([p.nelement() for p in self.model.parameters()]))
-        if config.use_wandb:
-            os.environ["WANDB_MODE"] = "offline" # adapt HPC environment
-            wandb.init(
-                project=config.wandb_project, 
-                name=config.wandb_run,
-                config={
-                    "learning_rate": config.lr,
-                    "weight_decay": config.weight_decay,
-                    "batch_size": config.batch_size,
-                    "epochs": self.epochs,
-                    "device": self.device,
-                    "train_sample_ratio": config.train_sample_ratio,
-                    "val_sample_ratio": config.val_sample_ratio,
-                    "total_training_steps": total_steps
-                }
-            )
-            wandb.watch(self.model, log=None)
-        else:
-            os.environ["WANDB_MODE"] = "disabled"  # Disable Weights & Biases logging
-        os.makedirs(self.model_save_path, exist_ok=True)
-        # Create collate functions
-        # default train mlm
-        self.mlm_collate = MLMCollateFn(
-            tokenizer, 
-            config.seq_len, 
-            train=True
-            ) if config.train_mlm else None
-        self.anp_collate = ANPCollateFn(
-            tokenizer, 
-            config.seq_len
-            ) if config.train_anp else None
-        self.big_collate = BIGCollateFn(
-            tokenizer, 
-            config.seq_len,
-        ) if config.train_big else None
-        self.gc_collate = GCCollateFn(
-            tokenizer, 
-            config.seq_len,
-        ) if config.train_gc else None
-        
-        # Update combined_collate to support four tasks
-        self.combined_collate = CombinedCollateFn(
-            self.mlm_collate, 
-            self.anp_collate,
-            self.big_collate,
-            self.gc_collate
+        self.optim = torch.optim.Adam(
+            self.model.parameters(),
+            lr=config.lr,
+            betas=config.betas,
+            weight_decay=config.weight_decay,
         )
-        train_samples_per_epoch = int(len(train_dataset) * config.train_sample_ratio)
-        steps_per_epoch = math.ceil(train_samples_per_epoch / config.batch_size)
-        total_steps = steps_per_epoch * config.epochs
-        
-        self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
-            self.optim,
-            max_lr=1e-3,
-            total_steps=total_steps,
-            pct_start=0.3,
-            anneal_strategy="cos",
-            final_div_factor=1e2,
-        )
-        self.loss_weights = {
-            "mlm": 1.0,
-            "anp": 1.0,
-            "big": 1.0,
-            "gc": 1.0
+        self.scheduler = None  # created in train() once the dataset size is known
+
+        self.use_amp = getattr(config, "use_amp", True) and self.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
+        self.loss_weights = getattr(config, "loss_weights", None) or {
+            "mlm": 1.0, "anp": 1.0, "big": 1.0, "gc": 1.0,
         }
-        wandb.config.update({
-            "mlm_loss_weight": self.loss_weights["mlm"],
-            "anp_loss_weight": self.loss_weights["anp"],
-            "big_loss_weight": self.loss_weights["big"],
-            "gc_loss_weight": self.loss_weights["gc"]
-        })
-    def create_subset(self, dataset, indices):
-        """Create dataset subset (compatible with custom datasets)"""
-        return Subset(dataset, indices) 
-    def create_dataloader(self, dataset, batch_size, shuffle=True):
-        """Create DataLoader (override parent method)"""
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            num_workers=6,
-            prefetch_factor=3,
-            persistent_workers=True,
-            pin_memory=True,
-            collate_fn=self.combined_collate,
-            shuffle=shuffle
-        )
-    def sample_dataset_indices(self, dataset, sample_ratio, dataset_type):
-        """Non-repetitive sampling, continue sampling after reset"""
-        if dataset_type == "training":
-            unsampled = self.train_unsampled_indices
-            sampled = self.train_sampled_indices
-        else:
-            unsampled = self.valid_unsampled_indices
-            sampled = self.valid_sampled_indices
+        self.enabled_tasks = [t for t in ("mlm", "anp", "big", "gc")
+                              if getattr(config, f"train_{t}", True)]
 
-        total_size = len(dataset)
-        sample_size = int(total_size * sample_ratio)
-
-        # If there are not enough unsampled samples, reset the sampling state
-        if len(unsampled) < sample_size:
-            print(f"Resetting {dataset_type} sampling pool after {len(sampled)} samples seen")
-            # Put the sampled samples back into the unsampled pool
-            unsampled.update(sampled)
-            sampled.clear()
-
-        # Randomly select samples from the unsampled pool
-        selected_indices = random.sample(list(unsampled), sample_size)
-
-        # Update sampled and unsampled sets
-        sampled.update(selected_indices)
-        unsampled.difference_update(selected_indices)
-
-        print(f"Sampling {sample_size} {dataset_type} samples "
-              f"({len(sampled)}/{total_size} total sampled)")
-        
-        return selected_indices
-    def train(self):
-        for epoch in range(self.epochs):
-            # Set random seed
-            self.sample_seed = epoch + 1
-            torch.manual_seed(self.sample_seed)
-            np.random.seed(self.sample_seed)
-            random.seed(self.sample_seed)
-            
-            # Sample training set
-            train_indices = self.sample_dataset_indices(
-                self.full_train_dataset, 
-                self.config.train_sample_ratio,
-                "training"
-            )
-            # Create subset in a compatible way
-            train_subset = self.create_subset(self.full_train_dataset, train_indices)
-            
-            # Create task datasets (add BIG and GC tasks)
-            mlm_train_dataset = TaskDataset(train_subset, "mlm") if self.config.train_mlm else None
-            anp_train_dataset = TaskDataset(train_subset, "anp") if self.config.train_anp else None
-            big_train_dataset = TaskDataset(train_subset, "big") if self.config.train_big else None
-            gc_train_dataset = TaskDataset(train_subset, "gc") if self.config.train_gc else None
-            
-            # Create data loaders
-            mlm_train_loader = self.create_dataloader(mlm_train_dataset, self.config.batch_size) if self.config.train_mlm else None
-            anp_train_loader = self.create_dataloader(anp_train_dataset, self.config.batch_size) if self.config.train_anp else None
-            big_train_loader = self.create_dataloader(big_train_dataset, self.config.batch_size) if self.config.train_big else None
-            gc_train_loader = self.create_dataloader(gc_train_dataset, self.config.batch_size) if self.config.train_gc else None
-
-            
-            # Training phase
-            train_loss = self.train_epoch(
-                epoch, 
-                mlm_train_loader, 
-                anp_train_loader,
-                big_train_loader,
-                gc_train_loader
-            )
-            
-            # Sample validation set
-            valid_indices = self.sample_dataset_indices(
-                self.full_valid_dataset, 
-                self.config.val_sample_ratio,
-                "validation"
-            )
-            # Create subset in a compatible way
-            valid_subset = self.create_subset(self.full_valid_dataset, valid_indices)
-            
-            # Create validation task datasets
-            mlm_valid_dataset = TaskDataset(valid_subset, "mlm") if self.config.train_mlm else None
-            anp_valid_dataset = TaskDataset(valid_subset, "anp") if self.config.train_anp else None
-            big_valid_dataset = TaskDataset(valid_subset, "big") if self.config.train_big else None
-            gc_valid_dataset = TaskDataset(valid_subset, "gc") if self.config.train_gc else None
-            
-            # Create validation data loaders
-            mlm_valid_loader = self.create_dataloader(mlm_valid_dataset, self.config.batch_size, shuffle=False) if self.config.train_mlm else None
-            anp_valid_loader = self.create_dataloader(anp_valid_dataset, self.config.batch_size, shuffle=False) if self.config.train_anp else None
-            big_valid_loader = self.create_dataloader(big_valid_dataset, self.config.batch_size, shuffle=False) if self.config.train_big else None
-            gc_valid_loader = self.create_dataloader(gc_valid_dataset, self.config.batch_size, shuffle=False) if self.config.train_gc else None
-            
-            # Validation phase
-            valid_loss = self.validate_epoch(
-                epoch, 
-                mlm_valid_loader, 
-                anp_valid_loader,
-                big_valid_loader,
-                gc_valid_loader
-            )
-            
-            # Log to wandb
-            wandb.log({
-                "epoch": epoch + 1,
-                "train_loss": train_loss,
-                "valid_loss": valid_loss,
-            })
-            
-            # Save checkpoint
-            checkpoint_path = os.path.join(self.model_save_path, f"bert-epoch-{epoch+1}.pth")
-            torch.save(self.model.state_dict(), checkpoint_path)
-            
-            # Save best model
-            if valid_loss < self.best_loss:
-                self.best_loss = valid_loss
-                model_save_path = os.path.join(self.model_save_path, "bert-best.pth")
-                torch.save(self.model.state_dict(), model_save_path)
-                print(f"Saved best model with validation loss: {valid_loss:.4f}")
-                
-        print("BERT training completed!")
-        wandb.finish()
-
-    def train_epoch(self, epoch, mlm_train_loader, anp_train_loader, big_train_loader, gc_train_loader):
-        self.model.train()
-        total_loss = 0.0
-        total_batches = 0
-        # Create iterators
-        mlm_iter = iter(mlm_train_loader) if mlm_train_loader is not None else iter([])
-        anp_iter = iter(anp_train_loader) if anp_train_loader is not None else iter([])
-        big_iter = iter(big_train_loader) if big_train_loader is not None else iter([])
-        gc_iter = iter(gc_train_loader) if gc_train_loader is not None else iter([])
-
-        # Determine the maximum number of batches
-        max_batches = max(
-            len(mlm_train_loader) if mlm_train_loader is not None else 0,
-            len(anp_train_loader) if anp_train_loader is not None else 0,
-            len(big_train_loader) if big_train_loader is not None else 0,
-            len(gc_train_loader) if gc_train_loader is not None else 0
-        )
-
-        data_iter = tqdm.tqdm(
-            range(max_batches),
-            desc=f"Epoch {epoch+1} Train",
-            total=max_batches,
-            bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
-        )
-
-
-        for i in data_iter:
-            # ====================== Phase 1: MLM, ANP, BIG tasks ======================
-            task_losses = []
-            mlm_loss = anp_loss = big_loss = gc_loss = 0
-
-            # Handle MLM task
-            try:
-                mlm_batch = next(mlm_iter)
-                mlm_task_dict = self.prepare_task_dict(mlm_batch)
-                mlm_loss, _ = self.model(mlm_task_dict)
-
-                task_losses.append(mlm_loss * self.loss_weights["mlm"])
-            except StopIteration:
-                pass
-
-            # Handle ANP task
-            try:
-                anp_batch = next(anp_iter)
-                anp_task_dict = self.prepare_task_dict(anp_batch)
-                anp_loss, _ = self.model(anp_task_dict)
-                task_losses.append(anp_loss * self.loss_weights["anp"])
-            except StopIteration:
-                pass
-
-            # Handle BIG task
-            try:
-                big_batch = next(big_iter)
-                big_task_dict = self.prepare_task_dict(big_batch)
-                big_loss, _ = self.model(big_task_dict)
-                task_losses.append(big_loss * self.loss_weights["big"])
-            except StopIteration:
-                pass
-
-            # Handle GC task
-            try:
-                gc_batch = next(gc_iter)
-                gc_task_dict = self.prepare_task_dict(gc_batch)
-                gc_loss, _ = self.model(gc_task_dict)
-                task_losses.append(gc_loss * self.loss_weights["gc"])
-            except StopIteration:
-                pass
-            # Compute loss and update
-            loss = sum(task_losses)
-            batch_loss = loss.item()
-
-            # Zero gradients
-            self.optim.zero_grad()
-
-            # Mixed precision training
-            if self.use_amp:
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optim)
-                self.scaler.update()
-            else:
-                loss.backward()
-                self.optim.step()
-
-            # Update learning rate
-            self.optim_schedule.step()
-
-            # Accumulate loss
-            total_loss += batch_loss
-            total_batches += 1
-
-            # Update progress bar
-            avg_loss = total_loss / total_batches
-            data_iter.set_postfix(loss=batch_loss, avg_loss=avg_loss)
-
-            # Log to wandb
-            if i % self.log_freq == 0:
-                log_data = {
-                    "batch": epoch * max_batches + i,
-                    "batch_train_loss": batch_loss,
-                    "batch_avg_train_loss": avg_loss,
-                    "lr": self.optim_schedule.get_last_lr()[0],
-                }
-
-                # Log each task's loss
-                if mlm_loss != 0:
-                    log_data["mlm_loss"] = mlm_loss.item()
-                if anp_loss != 0:
-                    log_data["anp_loss"] = anp_loss.item()
-                if big_loss != 0:
-                    log_data["big_loss"] = big_loss.item()
-                if gc_loss != 0:
-                    log_data["gc_loss"] = gc_loss.item()
-
-                wandb.log(log_data)
-
-        avg_epoch_loss = total_loss / total_batches if total_batches > 0 else 0.0
-        print(f"Epoch {epoch+1} Train loss: {avg_epoch_loss:.4f}")
-        return avg_epoch_loss
-
-    def validate_epoch(self, epoch, mlm_valid_loader, anp_valid_loader, big_valid_loader, gc_valid_loader):
-        self.model.eval()
-        total_loss = 0.0
-        total_batches = 0
-    
-        # Validate MLM task
-        if mlm_valid_loader is not None:
-            with torch.no_grad():
-                for mlm_batch in mlm_valid_loader:
-                    if "input_ids" in mlm_batch and len(mlm_batch["input_ids"]) == 0:
-                        continue
-                    mlm_task_dict = self.prepare_task_dict(mlm_batch)
-                    mlm_loss, _ = self.model(mlm_task_dict)
-                    total_loss += mlm_loss.item()
-                    total_batches += 1
-        
-        # Validate ANP task
-        if anp_valid_loader is not None:
-            with torch.no_grad():
-                for anp_batch in anp_valid_loader:
-                    if "input_ids" in anp_batch and len(anp_batch["input_ids"]) == 0:
-                        continue
-                        
-                    anp_task_dict = self.prepare_task_dict(anp_batch)
-                    anp_loss, _ = self.model(anp_task_dict)
-                    total_loss += anp_loss.item()
-                    total_batches += 1
-        
-        # Validate BIG task
-        if big_valid_loader is not None:
-            with torch.no_grad():
-                for big_batch in big_valid_loader:
-                    if "input_ids" in big_batch and len(big_batch["input_ids"]) == 0:
-                        continue
-                        
-                    big_task_dict = self.prepare_task_dict(big_batch)
-                    big_loss, _ = self.model(big_task_dict)
-                    total_loss += big_loss.item()
-                    total_batches += 1
-        
-        # Validate GC task
-        if gc_valid_loader is not None:
-            with torch.no_grad():
-                for gc_batch in gc_valid_loader:
-                    if "input_ids" in gc_batch and len(gc_batch["input_ids"]) == 0:
-                        continue
-                        
-                    gc_task_dict = self.prepare_task_dict(gc_batch)
-                    gc_loss, _ = self.model(gc_task_dict)
-                    total_loss += gc_loss.item()
-                    total_batches += 1
-        
-        avg_epoch_loss = total_loss / total_batches if total_batches > 0 else float('inf')
-        print(f"Epoch {epoch+1} Valid loss: {avg_epoch_loss:.4f}")
-        return avg_epoch_loss
-    def prepare_task_dict(self, data):
-        task_type = data.get("task_type", "mlm")
-        task_dict = {"task_type": task_type}
-        task_dict.update({
-            'input_ids': data["input_ids"].to(self.device),
-            'segment_ids': data.get("segment_ids", None).to(self.device) if "segment_ids" in data else None,
-            'labels': data["labels"].to(self.device)
-        })        
-        return task_dict
-
-class BERTFinetuneTrainer:
-    def __init__(
-        self,
-        model: CFGFusionModel,
-        train_dataset,  # Full training dataset
-        val_dataset,    # Full validation dataset
-        config
-    ):
-        self.config = config
-        self.device = config.device
-        self.model = model.to(self.device)
-        self.train_dataset = train_dataset  # Save full training dataset
-        self.val_dataset = val_dataset      # Save full validation dataset
-        self.log_freq = config.log_freq
-        self.num_epochs = config.epochs
-        self.model_save_path = config.checkpoint_save_path
-        self.use_amp = config.use_amp
-        self.best_accuracy = 0
-        self.best_val_loss = float('inf')
-        
-        # DataLoader parameters
-        self.batch_size = config.batch_size
-        
-        # Sampling seed
-        self.sample_seed = 42
-        
-        # Initialize sampling state
-        self.train_sampled_indices = set()
-        self.train_unsampled_indices = set(range(len(train_dataset)))
-        self.val_sampled_indices = set()
-        self.val_unsampled_indices = set(range(len(val_dataset)))
-        
-        # Optimizer and loss function
-        self.optimizer = Adam(
-            self.model.parameters(), 
-            lr=config.lr, 
-            betas=config.betas, 
-            weight_decay=config.weight_decay
-        )
-        self.criterion = nn.CosineEmbeddingLoss(margin=0.0)
-        
-        # Calculate total global steps
-        train_samples_per_epoch = int(len(train_dataset) * config.train_sample_ratio)
-        steps_per_epoch = math.ceil(train_samples_per_epoch / config.batch_size)
-        total_steps = steps_per_epoch * config.epochs
-
-        # Initialize global learning rate scheduler
-        self.optim_schedule = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=1e-3,
-            total_steps=total_steps,
-            pct_start=0.3,
-            anneal_strategy="cos",
-            final_div_factor=1e2,
-            div_factor=25,
-            three_phase=False
-        )
-        
-        # Mixed precision training
-        if self.use_amp:
-            self.scaler = torch.amp.GradScaler('cuda')
-        else:
-            self.scaler = None
-            
-        # Initialize wandb if enabled
-        if config.use_wandb:
-            os.environ["WANDB_MODE"] = "offline" # adapt HPC environment
+        # wandb (offline by default, like the previous setup)
+        self.use_wandb = getattr(config, "use_wandb", False)
+        if self.use_wandb:
+            import wandb
+            os.environ.setdefault("WANDB_MODE", "offline")
             wandb.init(
-                project=config.wandb_project,
-                name=config.wandb_run,
+                project=getattr(config, "wandb_project", "biai"),
+                name=getattr(config, "wandb_run", "bert4-pretrain"),
                 config={
-                    "batch_size": config.batch_size,
                     "learning_rate": config.lr,
+                    "batch_size": config.batch_size,
                     "epochs": config.epochs,
-                    "device": config.device,
-                    "train_sample_ratio": config.train_sample_ratio,
-                    "val_sample_ratio": config.val_sample_ratio,
-                    "total_training_steps": total_steps
-                }
+                    "device": str(self.device),
+                    "loss_weights": self.loss_weights,
+                    "tasks": self.enabled_tasks,
+                },
             )
-            wandb.watch(self.model, log=None)
+            self.wandb = wandb
         else:
             os.environ["WANDB_MODE"] = "disabled"
-        
-        # Ensure output directory exists
+            self.wandb = None
+
+        self.collates = {
+            "mlm": MLMCollateFn(tokenizer, config.seq_len,
+                                max_samples=getattr(config, "max_samples", 40),
+                                train=True),
+            "anp": ANPCollateFn(tokenizer, config.seq_len,
+                                max_samples=getattr(config, "max_samples", 40),
+                                train=True),
+            "big": BIGCollateFn(tokenizer, config.seq_len,
+                                max_samples=getattr(config, "max_samples", 40),
+                                train=True),
+            "gc": GCCollateFn(tokenizer, config.seq_len,
+                              max_samples=getattr(config, "max_samples", 40),
+                              train=True),
+        }
+        self.combined_collate = CombinedCollateFn(
+            mlm_collate=self.collates["mlm"],
+            anp_collate=self.collates["anp"],
+            big_collate=self.collates["big"],
+            gc_collate=self.collates["gc"],
+        )
+        self.best_loss = float("inf")
+        self.model_save_path = config.checkpoint_save_path
+        self.best_path = os.path.join(config.checkpoint_save_path, "bert-best")
         os.makedirs(config.checkpoint_save_path, exist_ok=True)
 
-    def train(self):
-        print(f"Starting training on {self.device}...")
-        for epoch in range(self.num_epochs):
-            print(f"\nEpoch {epoch+1}/{self.num_epochs}")
-            
-            # Set random seed for reproducibility
-            self.sample_seed = epoch + 1
-            torch.manual_seed(self.sample_seed)
-            np.random.seed(self.sample_seed)
-            random.seed(self.sample_seed)
-            
-            # Sample training set
-            train_indices = self.sample_dataset_indices(
-                self.train_dataset, 
-                self.config.train_sample_ratio,
-                "training"
+    # ------------------------------------------------------------------ #
+    def train(self, train_dataset, val_dataset=None):
+        if getattr(self.config, "use_scheduler", False):
+            total_steps = math.ceil(
+                len(train_dataset) * self.config.train_sample_ratio
+                / self.config.batch_size
+            ) * self.config.epochs
+            self.scheduler = get_linear_schedule_with_warmup(
+                self.optim,
+                num_warmup_steps=int(0.3 * total_steps),
+                num_training_steps=total_steps,
             )
-            
-            # Sample validation set
-            val_indices = self.sample_dataset_indices(
-                self.val_dataset, 
-                self.config.val_sample_ratio,
-                "validation"
-            )
-            
-            # Create sampled datasets
-            train_subset = Subset(self.train_dataset, train_indices)
-            val_subset = Subset(self.val_dataset, val_indices)
-            
-            # Create DataLoaders
-            train_loader = self.create_data_loader(train_subset, shuffle=True)
-            val_loader = self.create_data_loader(val_subset, shuffle=False)
-            
-            # Training phase
-            train_loss = self.train_epoch(epoch, train_loader)
-            
-            # Validation phase
-            val_loss, val_acc = self.validate_epoch(epoch, val_loader)
-            
-            # Log epoch metrics to wandb
-            if self.config.use_wandb:
-                wandb.log({
-                    "epoch": epoch + 1,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "val_accuracy": val_acc,
-                })
-            
-            # Save best model
-            if val_acc > self.best_accuracy:
-                self.best_accuracy = val_acc
-                model_save_path = os.path.join(self.model_save_path, "CFGFusion-best.pth")
-                torch.save(self.model.state_dict(), model_save_path)
-                print(f"Saved new best model with accuracy {val_acc:.4f}")
-            
-            # Save checkpoint
-            checkpoint_save_path = os.path.join(self.model_save_path, f"CFGFusion-epoch-{epoch}.pth")
-            torch.save(self.model.state_dict(), checkpoint_save_path)
-        
-        print("Training completed!")
-        if self.config.use_wandb:
-            wandb.finish()
+        for epoch in range(self.config.epochs):
+            torch.manual_seed(self.config.seed + epoch)
+            np.random.seed(self.config.seed + epoch)
+            random.seed(self.config.seed + epoch)
 
-    def sample_dataset_indices(self, dataset, sample_ratio, dataset_type):
-        """Non-repetitive sampling, continue sampling after reset"""
-        if dataset_type == "training":
-            unsampled = self.train_unsampled_indices
-            sampled = self.train_sampled_indices
-        else:
-            unsampled = self.val_unsampled_indices
-            sampled = self.val_sampled_indices
+            train_loss = self._run_epoch(train_dataset, epoch, train=True)
+            print(f"Epoch {epoch + 1}/{self.config.epochs} train loss: {train_loss:.4f}")
 
-        total_size = len(dataset)
-        sample_size = int(total_size * sample_ratio)
-
-        # If there are not enough unsampled samples, reset the sampling state
-        if len(unsampled) < sample_size:
-            print(f"Resetting {dataset_type} sampling pool after {len(sampled)} samples seen")
-            # Put the sampled samples back into the unsampled pool
-            unsampled.update(sampled)
-            sampled.clear()
-
-        # Randomly select samples from the unsampled pool
-        selected_indices = random.sample(list(unsampled), sample_size)
-
-        # Update sampled and unsampled sets
-        sampled.update(selected_indices)
-        unsampled.difference_update(selected_indices)
-
-        print(f"Sampling {sample_size} {dataset_type} samples "
-              f"({len(sampled)}/{total_size} total sampled)")
-        
-        return selected_indices
-
-    def create_data_loader(self, dataset, shuffle=True):
-        """Create DataLoader"""
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=shuffle,
-            num_workers=6,
-            prefetch_factor=3,
-            persistent_workers=True,
-            pin_memory=True,
-            collate_fn=sparse_pair_collate_fn,
-        )
-
-    def train_epoch(self, epoch, train_loader):
-        self.model.train()
-        total_loss = 0
-        progress = tqdm.tqdm(
-            train_loader, 
-            desc=f"Epoch {epoch+1} Train",
-            total=len(train_loader),
-            bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
-        )
-        
-        for i, (a_ids, a_adj, t_ids, t_adj, labels) in enumerate(progress):
-            if len(a_ids) == 0 or len(t_ids) == 0:
-                continue
-            if isinstance(a_ids, torch.Tensor) and isinstance(t_ids, torch.Tensor):
-                a_ids, t_ids = a_ids.to(self.device), t_ids.to(self.device)
-                a_adj, t_adj = a_adj.to(self.device), t_adj.to(self.device)
-            labels = labels.to(self.device)
-            
-            with torch.autocast(device_type=self.device, enabled=self.use_amp):
-                a_embeddings = self.model(a_ids, a_adj)
-                t_embeddings = self.model(t_ids, t_adj)
-                loss = self.criterion(a_embeddings, t_embeddings, labels.float())
-            
-            # Backpropagation
-            self.optimizer.zero_grad()
-            if self.use_amp and self.scaler:
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+            if val_dataset is not None:
+                val_loss = self._run_epoch(val_dataset, epoch, train=False)
+                print(f"Epoch {epoch + 1}/{self.config.epochs} val   loss: {val_loss:.4f}")
+                if self.wandb is not None:
+                    self.wandb.log({"epoch": epoch + 1, "train_loss": train_loss,
+                                    "val_loss": val_loss})
+                if val_loss < self.best_loss:
+                    self.best_loss = val_loss
+                    self.model.save_pretrained(self.best_path)
+                    print(f"Saved best model to {self.best_path}")
+                # Snapshot every 5 epochs so intermediate checkpoints survive
+                # later training (ablation-friendly).
+                if (epoch + 1) % 5 == 0:
+                    snap = os.path.join(self.model_save_path, f"bert-epoch-{epoch + 1}")
+                    self.model.save_pretrained(snap)
+                    print(f"Saved epoch snapshot to {snap}")
             else:
-                loss.backward()
-                self.optimizer.step()
-            
-            # Logging
-            total_loss += loss.item()
-            progress.set_postfix(loss=loss.item())
-            
-            if i % self.log_freq == 0 and self.config.use_wandb:
-                wandb.log({
-                    "batch_train_loss": loss.item(),
-                    "lr": self.optim_schedule.get_last_lr()[0]
-                })
-            
-            # Update learning rate
-            self.optim_schedule.step()
-        
-        avg_loss = total_loss / len(train_loader)
-        print(f"Train Loss: {avg_loss:.4f}")
-        return avg_loss
+                if self.wandb is not None:
+                    self.wandb.log({"epoch": epoch + 1, "train_loss": train_loss})
 
-    def validate_epoch(self, epoch, val_loader):
-        self.model.eval()
-        total_loss = 0
-        correct = 0
-        total = 0
-        progress = tqdm.tqdm(
-            val_loader, 
-            desc=f"Epoch {epoch+1} Valid",
-            total=len(val_loader),
-            bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
-        )
-        
-        with torch.no_grad():
-            for i, (a_ids, a_adj, t_ids, t_adj, labels) in enumerate(progress):
-                if len(a_ids) == 0 or len(t_ids) == 0:
+        if self.wandb is not None:
+            self.wandb.finish()
+        # Completion marker so external tooling (e.g. pipeline.py) can tell a
+        # fully-finished run from a crashed one.
+        with open(os.path.join(self.model_save_path, "train-done.json"), "w") as f:
+            json.dump({"epochs": self.config.epochs, "best_loss": self.best_loss}, f)
+
+    def _run_epoch(self, dataset, epoch, train=True):
+        # Use a fixed validation sample/mask set so best-checkpoint selection
+        # compares like with like. Training remains epoch-dependent.
+        epoch_seed = self.config.seed + epoch if train else self.config.seed + 100_000
+        torch.manual_seed(epoch_seed)
+        np.random.seed(epoch_seed)
+        random.seed(epoch_seed)
+        if train:
+            self.model.train()
+        else:
+            self.model.eval()
+        loaders = self._make_loader(dataset, train)
+        total_loss, total_batches = 0.0, 0
+        desc = "Train" if train else "Valid"
+        for loader in loaders:
+            for batch in loader:
+                if batch["input_ids"].size(0) == 0:
                     continue
-                if isinstance(a_ids, torch.Tensor) and isinstance(t_ids, torch.Tensor):
-                    a_ids, t_ids = a_ids.to(self.device), t_ids.to(self.device)
-                    a_adj, t_adj = a_adj.to(self.device), t_adj.to(self.device)
-                labels = labels.to(self.device)
-                a_embeddings = self.model(a_ids, a_adj)
-                t_embeddings = self.model(t_ids, t_adj)
-                loss = self.criterion(a_embeddings, t_embeddings, labels.float())
-                
-                # Calculate accuracy
-                cosine_sim = F.cosine_similarity(a_embeddings, t_embeddings, dim=1)
-                idx = cosine_sim > 0
-                predictions = torch.zeros_like(cosine_sim)
-                predictions[idx] = 1
-                predictions[~idx] = -1
-                correct += (predictions.to(torch.int32) == labels.to(torch.int32)).sum().item()
+                loss = self._train_step(batch) if train else self._eval_step(batch)
+                total_loss += loss
+                total_batches += 1
+        if self.scheduler is not None and train:
+            self.scheduler.step()
+        return total_loss / max(total_batches, 1)
+
+    def _make_loader(self, dataset, train=True):
+        ratio = (self.config.train_sample_ratio if train
+                 else getattr(self.config, "val_sample_ratio", 1.0))
+        if ratio < 1.0:
+            n = max(1, int(len(dataset) * ratio))
+            indices = random.sample(range(len(dataset)), n)
+            dataset = Subset(dataset, indices)
+        task_datasets = [TaskDataset(dataset, t) for t in self.enabled_tasks]
+        loaders = []
+        for td in task_datasets:
+            loaders.append(DataLoader(
+                td,
+                batch_size=self.config.batch_size,
+                shuffle=train,
+                num_workers=getattr(self.config, "num_workers", 0),
+                collate_fn=self.combined_collate,
+                drop_last=False,
+            ))
+        return loaders
+
+    def _task_step(self, task_name, batch, train):
+        """One forward/backward for a single task batch."""
+        input_ids = batch["input_ids"].to(self.device)
+        token_type_ids = batch["token_type_ids"].to(self.device)
+        attention_mask = batch["attention_mask"].to(self.device)
+        labels = batch["labels"].to(self.device)
+
+        kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
+        }
+        if task_name == "mlm":
+            kwargs["mlm_labels"] = labels
+        elif task_name == "anp":
+            kwargs["anp_labels"] = labels
+        elif task_name == "big":
+            kwargs["big_labels"] = labels
+        elif task_name == "gc":
+            kwargs["gc_labels"] = labels
+
+        if self.use_amp and train:
+            with torch.amp.autocast("cuda"):
+                out = self.model(**kwargs)
+            loss = out["losses"][task_name] * self.loss_weights[task_name]
+            self.optim.zero_grad()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optim)
+            self.scaler.update()
+        else:
+            with torch.set_grad_enabled(train):
+                out = self.model(**kwargs)
+            loss = out["losses"][task_name] * self.loss_weights[task_name]
+            if train:
+                self.optim.zero_grad()
+                loss.backward()
+                self.optim.step()
+        return loss.item()
+
+    def _train_step(self, batch):
+        return self._task_step(batch["task_type"], batch, train=True)
+
+    def _eval_step(self, batch):
+        with torch.no_grad():
+            return self._task_step(batch["task_type"], batch, train=False)
+
+
+class BERTFinetuneTrainer:
+    """Siamese fine-tuning of CFGFusionModel (CosineEmbeddingLoss)."""
+
+    def __init__(self, model, config):
+        self.config = config
+        self.device = _resolve_device(config.device)
+        self.model = model.to(self.device)
+        self.criterion = nn.CosineEmbeddingLoss(margin=getattr(config, "margin", 0.0))
+
+        self.optim = torch.optim.Adam(
+            self.model.parameters(),
+            lr=config.lr,
+            betas=config.betas,
+            weight_decay=config.weight_decay,
+        )
+        self.use_amp = getattr(config, "use_amp", True) and self.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
+        # Gradient accumulation: effective batch = batch_size * grad_accum
+        # (keeps the paper's batch=10 while fitting in GPU memory).
+        self.grad_accum = getattr(config, "grad_accum", 1)
+        # Let cuDNN cache algorithms for the native graph sizes it encounters.
+        torch.backends.cudnn.benchmark = True
+        self.best_score = (-1.0, -1.0)
+        anchor_pool = getattr(config, "val_anchor_pool", None)
+        candidate_pool = getattr(config, "val_candidate_pool", None)
+        self.val_anchor_keys = (load_function_keys(anchor_pool)
+                                if anchor_pool else None)
+        self.val_candidate_keys = (load_function_keys(candidate_pool)
+                                   if candidate_pool else None)
+        self.selection_metric = (
+            "full_pool_mrr10"
+            if self.val_anchor_keys is not None
+            and self.val_candidate_keys is not None
+            else "pair_accuracy"
+        )
+        os.makedirs(config.checkpoint_save_path, exist_ok=True)
+
+    def _step_optimizer(self, gradient_scale=1.0):
+        """Apply accumulated gradients and clear them for the next step."""
+        if gradient_scale != 1.0:
+            for parameter in self.model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.mul_(gradient_scale)
+        if self.use_amp:
+            self.scaler.step(self.optim)
+            self.scaler.update()
+        else:
+            self.optim.step()
+        self.optim.zero_grad(set_to_none=True)
+
+    def train(self, train_dataset, val_dataset=None):
+        for epoch in range(self.config.epochs):
+            torch.manual_seed(self.config.seed + epoch)
+            np.random.seed(self.config.seed + epoch)
+            random.seed(self.config.seed + epoch)
+
+            train_loss, train_acc = self._run_epoch(train_dataset, epoch, train=True)
+            print(f"Epoch {epoch + 1}/{self.config.epochs} "
+                  f"train loss: {train_loss:.4f} acc: {train_acc:.4f}")
+            if val_dataset is not None:
+                val_loss, val_acc = self._run_epoch(val_dataset, epoch, train=False)
+                print(f"Epoch {epoch + 1}/{self.config.epochs} "
+                      f"val   loss: {val_loss:.4f} acc: {val_acc:.4f}")
+                if (self.val_anchor_keys is not None
+                        and self.val_candidate_keys is not None):
+                    retrieval = evaluate_retrieval(
+                        self.model, val_dataset, self.device,
+                        self.val_anchor_keys, self.val_candidate_keys,
+                        opt_level=getattr(self.config, "task1_opt", "").upper(),
+                    )
+                    score = (retrieval["mrr10"], retrieval["rank1"])
+                    print(f"Epoch {epoch + 1}/{self.config.epochs} "
+                          f"val retrieval MRR10: {score[0]:.4f} "
+                          f"Rank1: {score[1]:.4f} "
+                          f"({retrieval['anchors']}x{retrieval['candidates']})")
+                else:
+                    # Kept for small synthetic smoke tests. The real Task 1
+                    # entry point always supplies full validation pools.
+                    score = (val_acc, 0.0)
+                if score > self.best_score:
+                    self.best_score = score
+                    path = os.path.join(self.config.checkpoint_save_path,
+                                        "CFGFusion-best.pth")
+                    torch.save(self.model.state_dict(), path)
+                    print(f"Saved best model to {path}")
+        # Completion marker (crashed runs must not be mistaken for done).
+        with open(os.path.join(self.config.checkpoint_save_path, "train-done.json"), "w") as f:
+            json.dump({
+                "epochs": self.config.epochs,
+                "selection_metric": self.selection_metric,
+                "best_mrr10": self.best_score[0],
+                "best_rank1": self.best_score[1],
+            }, f)
+
+    def _pack_by_budget(self, a_ids, a_adj, t_ids, t_adj, labels, budget=900):
+        """Split a logical batch by total native nodes without changing loss."""
+        groups = []
+        current = ([], [], [], [], [])
+        current_nodes = 0
+        for i in range(len(a_ids)):
+            pair_nodes = a_ids[i].shape[0] + t_ids[i].shape[0]
+            if current[0] and current_nodes + pair_nodes > budget:
+                groups.append(tuple(current))
+                current = ([], [], [], [], [])
+                current_nodes = 0
+            current[0].append(a_ids[i])
+            current[1].append(a_adj[i])
+            current[2].append(t_ids[i])
+            current[3].append(t_adj[i])
+            current[4].append(labels[i])
+            current_nodes += pair_nodes
+            if pair_nodes >= budget:
+                groups.append(tuple(current))
+                current = ([], [], [], [], [])
+                current_nodes = 0
+        if current[0]:
+            groups.append(tuple(current))
+        return groups
+
+    def _run_epoch(self, dataset, epoch, train=True):
+        nw = getattr(self.config, "num_workers", 0)
+        loader_kwargs = {"num_workers": nw}
+        if nw > 0:
+            loader_kwargs["prefetch_factor"] = getattr(self.config, "prefetch_factor", 2)
+        if train and getattr(self.config, "use_bucketing", True) and hasattr(dataset, "graph_sizes"):
+            sizes = dataset.graph_sizes()
+            batch_sampler = BucketBatchSampler(sizes, self.config.batch_size,
+                                               shuffle=True, seed=self.config.seed + epoch)
+            loader = DataLoader(
+                dataset,
+                batch_sampler=batch_sampler,
+                collate_fn=sparse_pair_collate_fn,
+                **loader_kwargs,
+            )
+        else:
+            loader = DataLoader(
+                dataset,
+                batch_size=self.config.batch_size,
+                shuffle=train,
+                collate_fn=sparse_pair_collate_fn,
+                drop_last=False,
+                **loader_kwargs,
+            )
+        total_loss, correct, total = 0.0, 0, 0
+        accum = self.grad_accum if train else 1
+        if train:
+            self.model.train()
+            self.optim.zero_grad(set_to_none=True)
+        else:
+            self.model.eval()
+        n_backward = 0
+        budget = getattr(self.config, "node_budget", 900)
+        for step, batch in enumerate(loader):
+            a_ids, a_adj, t_ids, t_adj, labels = batch
+            if len(labels) == 0:
+                continue
+            # Variable-size graphs: lists of per-graph tensors (ids) + sparse
+            # COO adjacencies; the model handles native sizes directly.
+            a_ids = [ids.to(self.device) for ids in a_ids]
+            t_ids = [ids.to(self.device) for ids in t_ids]
+            labels = labels.to(self.device)
+
+            # Node-budget packing: large graphs (hundreds of nodes) blow up
+            # memory when several are batched together, so a batch is split
+            # into groups whose combined node count stays under `budget`
+            # (small graphs stay batched; a single oversized graph forms its
+            # own group). Each group is forward + backward'd immediately so
+            # its activations are freed before the next group — otherwise
+            # several large graphs would be alive at once (the backward of
+            # the joint loss keeps every group's activations).
+            groups = self._pack_by_budget(a_ids, a_adj, t_ids, t_adj, labels,
+                                          budget)
+            n_total = labels.size(0)
+            batch_loss = 0.0
+            batch_cosines = []
+            for a_g, a_adj_g, t_g, t_adj_g, lab_g in groups:
+                lab_g = torch.stack(lab_g).to(self.device)
+                n_g = lab_g.size(0)
+                with torch.set_grad_enabled(train):
+                    with torch.amp.autocast(
+                            self.device.type, enabled=self.use_amp):
+                        a_emb_g = self.model(a_g, a_adj_g)
+                        t_emb_g = self.model(t_g, t_adj_g)
+                        raw_loss = self.criterion(
+                            a_emb_g, t_emb_g, lab_g.float())
+                        backward_loss = raw_loss * (n_g / n_total) / accum
+                if train:
+                    if self.use_amp:
+                        self.scaler.scale(backward_loss).backward()
+                    else:
+                        backward_loss.backward()
+                batch_loss += raw_loss.detach().item() * n_g / n_total
+                batch_cosines.append(F.cosine_similarity(
+                    a_emb_g.detach(), t_emb_g.detach(), dim=1))
+            n_backward += 1
+            if train and n_backward % accum == 0:
+                self._step_optimizer()
+            total_loss += batch_loss * n_total
+            with torch.no_grad():
+                cos = torch.cat(batch_cosines, dim=0)
+                pred = torch.where(cos > 0, torch.tensor(1.0, device=cos.device),
+                                   torch.tensor(-1.0, device=cos.device))
+                correct += (pred == labels).sum().item()
                 total += labels.size(0)
-                
-                # Logging
-                total_loss += loss.item()
-                accuracy = correct / total if total > 0 else 0
-                progress.set_postfix(loss=loss.item(), accuracy=accuracy)
-        
-        avg_loss = total_loss / len(val_loader)
-        accuracy = correct / total
-        print(f"Val Loss: {avg_loss:.4f}, Val Acc: {accuracy:.4f}")
-        return avg_loss, accuracy
+        # Flush the gradient-accumulation tail (last partial group of micro-batches).
+        tail = n_backward % accum
+        if train and tail:
+            # Each tail loss was divided by `accum`; restore the mean over the
+            # actual number of micro-batches before stepping.
+            self._step_optimizer(gradient_scale=accum / tail)
+        return total_loss / max(total, 1), correct / max(total, 1)

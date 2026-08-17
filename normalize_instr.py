@@ -1,179 +1,82 @@
 import multiprocessing
+import argparse
 import os
 import pickle
 import re
+import time
+import capstone
 from scipy.sparse import lil_matrix
 import json
 
 MAX_INSTRUCTION_BLOCK_SIZE = 1000  # Maximum number of instructions per block
 MIN_INSTRUCTION_BLOCK_SIZE = 6  # Minimum number of instructions per block
 
-with open("opcode_categories.json", "r") as f:
-    OPCODE_CATEGORIES = json.load(f)
-with open("register_types.json", "r") as f:
-    REGISTER_TYPES = json.load(f)
+# Fallback branch/call mnemonic set (capstone groups are preferred).
+JUMP_MNEMONICS = {
+    # x86
+    "jmp", "je", "jne", "ja", "jb", "jae", "jbe", "jg", "jge", "jl", "jle",
+    "call", "loop", "loope", "loopne", "jz", "jnz", "js", "jns", "jo", "jno",
+    "jc", "jnc", "jp", "jnp", "jcxz", "jecxz", "jrcxz", "ljmp", "lcall",
+    "retn", "retf",
+    # ARM (32/64)
+    "b", "bl", "bx", "blx", "br", "blr", "cbz", "cbnz", "tbz", "tbnz",
+    "beq", "bne", "bcs", "bhs", "bcc", "blo", "bmi", "bpl", "bvs", "bvc",
+    "bhi", "bls", "bge", "blt", "bgt", "ble", "bal", "svc", "hvc", "smc",
+    "bxj", "eret",
+}
 
 def normalize_instruction_assembly_code(instruction, arch_bits, Unknown=None):
+    """Lightweight tokenization of one assembly instruction.
+
+    Follows the paper's "tokens in the CFG blocks are regarded as words"
+    idea: keep the mnemonic and register names verbatim, and only replace
+    unbounded values (immediates, branch/call targets, memory displacements)
+    with unified placeholder tokens (<IMM> / <TARGET>). No hand-crafted
+    semantic categories (unlike the previous course pipeline which mapped
+    opcodes to categories and registers to <REG:gpr>, collapsing the vocab
+    to ~36 tokens and defeating the semantic-aware BERT pre-training).
     """
-    Compatible normalization function for angr/capstone.
-    :param instruction: capstone instruction object
-    :param arch_bits: architecture bit width (32 or 64)
-    """
-    # Get mnemonic and convert to lowercase
-    inst = instruction.mnemonic.lower()
-    
-    # Lookup opcode category
-    opcode_category = "unknown"
-    for prefix, category in OPCODE_CATEGORIES.items():
-        if inst.startswith(prefix):
-            opcode_category = category
-            break
-    
-    if opcode_category == "unknown":
-        if Unknown is not None and inst not in Unknown['unkown_opcode']:
-            print(f"Warning: Unknown Opcode '{inst}', using 'unknown' category.")
-            Unknown['unkown_opcode'].add(inst)
-    
-    normalized_inst = f"{opcode_category}:{inst}"
-    
-    # Process each operand
+    mnemonic = instruction.mnemonic.lower()
+
+    # Branch/call targets are <TARGET>; other immediates are <IMM>.
+    is_branch = False
+    try:
+        is_branch = (instruction.group(capstone.CS_GRP_JUMP)
+                     or instruction.group(capstone.CS_GRP_CALL))
+    except Exception:
+        pass
+    if not is_branch:
+        is_branch = mnemonic in JUMP_MNEMONICS
+
     operands = []
-    for i, op in enumerate(instruction.operands):
-        # Register operand
-        if op.type == 1:  # CS_OP_REG
-            reg_name = instruction.reg_name(op.reg).lower()
-            reg_type = REGISTER_TYPES.get(reg_name, "unknown")
-            
-            if reg_type == "unknown":
-                # Infer type based on architecture bit width and register name
-                if arch_bits == 32:
-                    # 32-bit architecture register handling
-                    if reg_name.startswith('e'):
-                        reg_type = 'gpr'  # 32-bit general purpose register (eax, ebx, etc.)
-                    elif reg_name in ['ax', 'bx', 'cx', 'dx']:
-                        reg_type = 'gpr16'  # 16-bit general purpose register
-                    elif reg_name in ['ah', 'al', 'bh', 'bl']:
-                        reg_type = 'gpr8'   # 8-bit general purpose register
-                    else:
-                        reg_type = 'gpr'    # Default as general purpose register
-                else:  # 64-bit architecture
-                    if reg_name.startswith('r') and reg_name[1:].isdigit():
-                        reg_type = 'gpr'   # 64-bit general purpose register (r8-r15)
-                    elif reg_name.startswith('r'):
-                        reg_type = 'gpr64' # Traditional 64-bit registers (rax, rbx, etc.)
-                    elif reg_name in ['eax', 'ebx']:
-                        reg_type = 'gpr32' # 32-bit mode registers
-                    else:
-                        reg_type = 'gpr'   # Default as general purpose register
-                
-                # Update register type mapping to avoid future warnings
-                REGISTER_TYPES[reg_name] = reg_type
-            
-            operands.append(f"<REG:{reg_type}>")
-            
-        # Immediate operand
-        elif op.type == 2:  # CS_OP_IMM:
-            # Determine max bits based on architecture
-            max_bits = 32 if arch_bits == 32 else 64
-            
-            # Special handling for jump instructions
-            jump_mnemonics = {'jmp', 'je', 'jne', 'call', 'ja', 'jb', 'jae', 'jbe', 'jg', 'jge', 'jl', 'jle'}
-            if instruction.mnemonic.lower() in jump_mnemonics:
-                operands.append("<TARGET>")
-            else:
-                abs_imm = abs(op.imm)
-                
-                # Classify immediate value based on architecture and size
-                if abs_imm == 0:
-                    operands.append("<IMM:zero>")
-                elif abs_imm < 2**8:
-                    operands.append("<IMM:8bit>")
-                elif abs_imm < 2**16:
-                    operands.append("<IMM:16bit>")
-                elif abs_imm < 2**32:
-                    operands.append("<IMM:32bit>")
-                elif arch_bits == 64 and abs_imm < 2**64:
-                    operands.append("<IMM:64bit>")
-                else:
-                    # Special case handling
-                    operands.append("<IMM:oversized>")
-                    
-        # Memory operand (consider architecture bit width)
-        elif op.type == 3:  # CS_OP_MEM
+    for op in instruction.operands:
+        if op.type == capstone.CS_OP_REG:  # 1
+            operands.append(instruction.reg_name(op.reg).lower())
+        elif op.type == capstone.CS_OP_IMM:  # 2
+            operands.append("<TARGET>" if is_branch else "<IMM>")
+        elif op.type == capstone.CS_OP_MEM:  # 3
             mem = op.mem
             mem_parts = []
-            
-            # Base register
             if mem.base != 0:
-                base_reg = instruction.reg_name(mem.base).lower()
-                base_type = REGISTER_TYPES.get(base_reg, "unknown")
-                if base_type == "unknown":
-                    # Infer based on architecture
-                    if arch_bits == 32 and base_reg.startswith('e'):
-                        base_type = "gpr"
-                    elif arch_bits == 64 and (base_reg.startswith('r') or base_reg in ['rax', 'rbx']):
-                        base_type = "gpr"
-                    else:
-                        base_type = "gpr"  # Default as general purpose register
-                mem_parts.append(f"<BASE:{base_type}>")
-            
-            # Index register
+                mem_parts.append(instruction.reg_name(mem.base).lower())
             if mem.index != 0:
-                index_reg = instruction.reg_name(mem.index).lower()
-                index_type = REGISTER_TYPES.get(index_reg, "unknown")
-                if index_type == "unknown":
-                    # Infer based on architecture
-                    if arch_bits == 32 and index_reg.startswith('e'):
-                        index_type = "gpr"
-                    elif arch_bits == 64 and (index_reg.startswith('r') or index_reg in ['rax', 'rbx']):
-                        index_type = "gpr"
-                    else:
-                        index_type = "gpr"  # Default as general purpose register
-                scale = mem.scale
-                mem_parts.append(f"<INDEX:{index_type}:{scale}>")
-            
-            # Displacement value classification (consider architecture)
+                index_name = instruction.reg_name(mem.index).lower()
+                mem_parts.append(f"{index_name}*{mem.scale}" if mem.scale != 1
+                                 else index_name)
             if mem.disp != 0:
-                abs_disp = abs(mem.disp)
-                # Adjust classification thresholds based on architecture
-                if arch_bits == 32:
-                    if abs_disp < 2**8:
-                        mem_parts.append("<DISP:small>")
-                    elif abs_disp < 2**16:
-                        mem_parts.append("<DISP:medium>")
-                    else:
-                        mem_parts.append("<DISP:large>")
-                else:  # 64-bit
-                    if abs_disp < 2**8:
-                        mem_parts.append("<DISP:small>")
-                    elif abs_disp < 2**16:
-                        mem_parts.append("<DISP:medium>")
-                    elif abs_disp < 2**32:
-                        mem_parts.append("<DISP:large>")
-                    else:
-                        mem_parts.append("<DISP:huge>")
-            
-            # Special handling for cases without base/index
+                mem_parts.append("<IMM>")
             if not mem_parts:
                 mem_parts.append("<ABS_MEM>")
-            
             operands.append("[" + "+".join(mem_parts) + "]")
-            
-        # Other operand types
-        else:
-            operands.append("<UNK_OP>")
-            if Unknown is not None and op.type not in Unknown['unknown_operand']:
-                print(f"Warning: Unknown Operand Type '{op.type}', using 'unknown_operand' type.")
-                Unknown['unknown_operand'].add(op.type)
-    
-    # Build normalized instruction
+        else:  # FP immediates, etc.
+            operands.append("<IMM>")
+
+    normalized = mnemonic
     if operands:
-        normalized_inst += " " + ", ".join(operands)
-    
-    return normalized_inst
+        normalized += " " + ", ".join(operands)
+    return normalized
 
 import angr
-import capstone
 
 def disassemble_function(binary_path, function_address=None, function_name=None):
     """
@@ -259,42 +162,60 @@ def process_binary_file(args):
             n_blocks = len(blocks)
             if n_blocks < MIN_INSTRUCTION_BLOCK_SIZE or n_blocks > MAX_INSTRUCTION_BLOCK_SIZE:
                 continue
-            
-            # Initialize function entry
+
+            # Handle duplicate function names (two different addresses with the
+            # same name): keep them separate to avoid polluting each other.
+            target_key = func.name
             if func.name not in results:
                 results[func.name] = dict()
+            elif addr not in results[func.name].get('addr_to_idx', {}):
+                name = f"{func.name}@{addr:#x}"
+                if name in results:
+                    continue
+                results[name] = dict()
+                target_key = name
 
             # Create address-to-index mapping
             # Sort basic blocks by address to ensure consistent index order
             sorted_blocks = sorted(blocks, key=lambda b: b.addr)
-            block_addrs = [block.addr for block in sorted_blocks]
-            addr_to_idx = {addr: idx for idx, addr in enumerate(block_addrs)}
-            # Save address-to-index mapping
-            results[func.name]['addr_to_idx'] = addr_to_idx
-            # Initialize adjacency matrix
-            adj_matrix = lil_matrix((n_blocks, n_blocks), dtype=int)
 
+            # 1. Normalize every block first, tolerating per-instruction and
+            #    per-block failures (a single bad instruction must not drop
+            #    the whole function, which previously left addr_to_idx
+            #    inconsistent with the block data).
+            block_data = {}
             for block in sorted_blocks:
-                # Generate adjacency matrix
-                node = cfg.model.get_any_node(block.addr)
+                try:
+                    instrs = []
+                    for insn in block.capstone.insns:
+                        try:
+                            instrs.append(normalize_instruction_assembly_code(
+                                insn, proj.arch.bits, Unknown=Unknown))
+                        except Exception:
+                            instrs.append("invalid")
+                    block_data[block.addr] = instrs
+                except Exception:
+                    continue  # skip this block entirely
+
+            good_addrs = sorted(block_data.keys())
+            if len(good_addrs) < MIN_INSTRUCTION_BLOCK_SIZE:
+                continue
+            addr_to_idx = {a: i for i, a in enumerate(good_addrs)}
+
+            # 2. Write the function entry only now that the block data is
+            #    complete and consistent.
+            entry = results[target_key]
+            entry['addr_to_idx'] = addr_to_idx
+            adj_matrix = lil_matrix((len(good_addrs), len(good_addrs)), dtype=int)
+            for block_addr in good_addrs:
+                node = cfg.model.get_any_node(block_addr)
                 succ = getattr(node, 'successors', [])
                 for succ_node in succ:
-                    if succ_node.addr in block_addrs:
-                        src_idx = addr_to_idx[block.addr]
-                        dest_idx = addr_to_idx[succ_node.addr]
-                        adj_matrix[src_idx, dest_idx] = 1
-
-                results[func.name][block.addr] = []
-                # Normalize instructions
-                for insn in block.capstone.insns:
-                    normalized_insn = normalize_instruction_assembly_code(
-                        insn, 
-                        proj.arch.bits,
-                        Unknown=Unknown
-                    )
-                    results[func.name][block.addr].append(normalized_insn)
-            # Convert sparse matrix to a serializable format (such as COO format)
-            results[func.name]['adjacency_matrix'] = adj_matrix.tocoo()
+                    if succ_node.addr in addr_to_idx:
+                        adj_matrix[addr_to_idx[block_addr],
+                                   addr_to_idx[succ_node.addr]] = 1
+                entry[block_addr] = block_data[block_addr]
+            entry['adjacency_matrix'] = adj_matrix.tocoo()
 
     except Exception as e:
         print(f"Error processing {binary_name}: {e}")
@@ -307,26 +228,44 @@ def process_binary_file(args):
 
 from tqdm import tqdm
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Extract native-size CFGs with angr")
+    parser.add_argument(
+        "--force", action="store_true",
+        help="re-extract and overwrite every selected local baseline pickle",
+    )
+    args = parser.parse_args()
     Unknown = {
         "unkown_opcode": set(),
         "unknown_reg": set(),
         "unknown_operand": set()
     }
     data_dir = '.'
-    binary_folder = os.path.join(data_dir, "Dataset-1")
+    binary_folder = os.path.join(data_dir, "data", "Dataset-1")
 
     save_root = "baseline"
     os.makedirs(save_root, exist_ok=True)
-    architecture = ['x86', 'x64']
+    architecture = ['x64', 'arm64']  # paper Task 1: x86-64 <-> ARM
     compiler = ['gcc']
     tasks = []
+    run_started_ns = time.time_ns()
+    seen_binary_names = {}
     for subfolder in os.listdir(binary_folder):
         subfolder_path = os.path.join(binary_folder, subfolder)
         if not os.path.isdir(subfolder_path):
             continue
+        if subfolder == "z3":  # too large, excluded
+            continue
         for bin_name in os.listdir(subfolder_path):
             bin_path = os.path.join(subfolder_path, bin_name)
-            if(os.path.exists(os.path.join(save_root, "output_"+bin_name+".pkl"))):
+            previous_project = seen_binary_names.get(bin_name)
+            if previous_project is not None and previous_project != subfolder:
+                raise ValueError(
+                    f"binary name {bin_name!r} occurs in both "
+                    f"{previous_project!r} and {subfolder!r}"
+                )
+            seen_binary_names[bin_name] = subfolder
+            if (not args.force and os.path.exists(
+                    os.path.join(save_root, "output_"+bin_name+".pkl"))):
                 continue
             key_words = re.split('[-_]', bin_name)
             intersection = len(set(key_words) & set(architecture)) > 0 and len(set(key_words) & set(compiler)) > 0
@@ -337,7 +276,7 @@ if __name__ == "__main__":
 
 
     # num_processes = min(multiprocessing.cpu_count(), len(tasks))
-    num_processes = 12
+    num_processes = 6  # keep memory usage bounded (15GB host)
     with multiprocessing.Pool(processes=num_processes) as pool:
         unknown_list = list(tqdm(pool.imap_unordered(process_binary_file, tasks), total=len(tasks)))
     # wait for all processes to finish
@@ -347,9 +286,27 @@ if __name__ == "__main__":
         Unknown['unkown_opcode'].update(unk.get('unkown_opcode', set()))
         Unknown['unknown_reg'].update(unk.get('unknown_reg', set()))
         Unknown['unknown_operand'].update(unk.get('unknown_operand', set()))
+    incomplete = []
+    for binary_path, destination in tasks:
+        output_path = os.path.join(
+            destination, "output_" + os.path.basename(binary_path) + ".pkl")
+        if (not os.path.exists(output_path)
+                or os.stat(output_path).st_mtime_ns < run_started_ns):
+            incomplete.append(binary_path)
+    if incomplete:
+        raise RuntimeError(
+            f"CFG extraction failed or stayed stale for {len(incomplete)} "
+            f"binaries; first entries: {incomplete[:5]}"
+        )
     Unknown['unkown_opcode'] = list(Unknown['unkown_opcode'])
     Unknown['unknown_reg'] = list(Unknown['unknown_reg'])
     Unknown['unknown_operand'] = list(Unknown['unknown_operand'])
     with open(os.path.join(".", "unknown_opcode.json"), "w") as f:
         # Merging Unknown information from all processes requires separate handling; here, only the main process's Unknown is saved
         json.dump(Unknown, f, indent=4)
+    with open(os.path.join(save_root, "normalize-done.json"), "w") as f:
+        json.dump({
+            "processed_binaries": len(tasks),
+            "force": args.force,
+            "extractor_mtime_ns": os.stat(__file__).st_mtime_ns,
+        }, f, indent=2)
