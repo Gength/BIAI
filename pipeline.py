@@ -80,12 +80,23 @@ def stage_ready(name):
         _newer_than_all(split_marker, split_dependencies)
         and os.path.exists(os.path.join(OUT, "binary-project-map.json"))
     )
-    model_sources = [
-        os.path.join(ROOT, "models", name) for name in
-        ("bert.py", "checkpoint_utils.py", "collatefn.py", "dataset.py",
-         "model.py", "retrieval.py", "tokenizer.py", "trainer.py")
-    ]
-    pretrain_dependencies = model_sources + [
+    def model_sources(*names):
+        return [os.path.join(ROOT, "models", name) for name in names]
+
+    # Dependency sets are intentionally stage-specific.  In particular,
+    # changes to graph fusion/retrieval must not invalidate a completed
+    # multi-hour BERT pretraining run which never imports those modules.
+    pretrain_sources = model_sources(
+        "bert.py", "checkpoint_utils.py", "collatefn.py", "dataset.py",
+        "tokenizer.py", "trainer.py")
+    graph_sources = model_sources(
+        "batch_sampler.py", "bert.py", "checkpoint_utils.py", "collatefn.py",
+        "dataset.py", "finetune_trainer.py", "graph_dataset.py", "model.py",
+        "retrieval.py", "tokenizer.py", "trainer.py")
+    task2_sources = model_sources(
+        "batch_sampler.py", "bert.py", "checkpoint_utils.py", "dataset.py",
+        "graph_dataset.py", "model.py", "tokenizer.py", "trainer.py")
+    pretrain_dependencies = pretrain_sources + [
         os.path.join(ROOT, "bert4_pretrain.py"),
         split_marker,
         os.path.join(OUT, "baseline-train.jsonl"),
@@ -95,11 +106,11 @@ def stage_ready(name):
     pretrain_ready = _completed_after(
         PRETRAIN_MARK, pretrain_done, pretrain_dependencies)
 
-    finetune_dependencies = model_sources + [
+    finetune_dependencies = graph_sources + [
         os.path.join(ROOT, "bert4_finetune.py"), PRETRAIN_MARK]
-    task2_dependencies = model_sources + [
+    task2_dependencies = task2_sources + [
         os.path.join(ROOT, "bert4_task2.py"), PRETRAIN_MARK]
-    eval_dependencies = model_sources + [
+    eval_dependencies = graph_sources + [
         os.path.join(ROOT, "bert_caculate_similarity.py")]
     checks = {
         "normalize": normalize_ready,
@@ -136,8 +147,14 @@ def run_stage(name, cmd, force=False):
     os.makedirs(LOG_DIR, exist_ok=True)
     print(f"[pipeline] === {name} ===", flush=True)
     t0 = time.time()
+    env = os.environ.copy()
+    # HF emits one longest-first truncation warning per sequence pair with the
+    # slow tokenizer (9.1M lines / 2.1GB in the last pretraining run).  The
+    # message is informational and the configured truncation is intentional.
+    env.setdefault("TRANSFORMERS_VERBOSITY", "error")
     with open(log_path(name), "w") as f:
-        proc = subprocess.run(cmd, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT)
+        proc = subprocess.run(
+            cmd, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, env=env)
     dt = (time.time() - t0) / 60
     if proc.returncode != 0:
         print(f"[pipeline] FAILED {name} after {dt:.1f} min — see {log_path(name)}")
@@ -152,7 +169,10 @@ def run_eval(name, result_name, cmd, force=False):
         return
     os.makedirs(RESULT_DIR, exist_ok=True)
     print(f"[pipeline] === {name} ===", flush=True)
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    env = os.environ.copy()
+    env.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    proc = subprocess.run(
+        cmd, cwd=ROOT, capture_output=True, text=True, env=env)
     text = proc.stdout + proc.stderr
     if proc.returncode != 0:
         with open(log_path(name), "w") as f:

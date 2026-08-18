@@ -20,6 +20,9 @@ cd "$(dirname "$0")"
 # Keep PyTorch's CUDA allocator on fixed segments for reproducible peak-memory
 # stress tests and training, as requested. Every pipeline subprocess inherits it.
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
+# The slow HF tokenizer otherwise writes one informational truncation warning
+# per sequence pair (millions of lines) even though truncation is intentional.
+export TRANSFORMERS_VERBOSITY="error"
 
 LOG_DIR="outputs/pipeline-logs"
 mkdir -p "$LOG_DIR"

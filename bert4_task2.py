@@ -18,12 +18,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from models.batch_sampler import WorkloadBatchSampler
 from models.tokenizer import AsmTokenizer
 from models.bert import BERTForPretraining
 from models.checkpoint_utils import backup_existing, clear_completion_marker
 from models.model import CFGFusionModel
-from models.dataset import Task2Dataset
-from models.trainer import _resolve_device, BucketBatchSampler
+from models.graph_dataset import Task2Dataset
+from models.trainer import _resolve_device
 
 
 class Config:
@@ -32,6 +33,7 @@ class Config:
     mpnn_readout_dim = 64
     cnn_out = 32
     graph_hidden_dim = 64
+    checkpoint_node_threshold = 1536
     num_classes = 4  # O0, O1, O2, O3
 
     batch_size = 10   # paper: batch size 10
@@ -44,7 +46,7 @@ class Config:
     prefetch_factor = 4
     device = "cuda"
     use_amp = True
-    node_budget = 900       # split forwards only; optimizer still sees batch=10
+    node_budget = 4000      # four worst-case 1000-node CFGs per memory group
     pretrained_path = os.path.join("outputs", "bert4-pretrain-hf", "bert-best")
     checkpoint_save_path = os.path.join("outputs", "bert4-task2-hf")
 
@@ -55,6 +57,20 @@ def collate(batch):
     adj_list = [adj for _, adj, _ in batch]
     labels = torch.tensor([lbl.item() for _, _, lbl in batch], dtype=torch.long)
     return ids_list, adj_list, labels
+
+
+def _loader_kwargs(config, device):
+    """DataLoader settings shared by train/validation/test."""
+    workers = config.num_workers
+    kwargs = {
+        "num_workers": workers,
+        "collate_fn": collate,
+        "pin_memory": device.type == "cuda",
+    }
+    if workers > 0:
+        kwargs["prefetch_factor"] = config.prefetch_factor
+        kwargs["persistent_workers"] = True
+    return kwargs
 
 
 def _pack_by_node_budget(ids, adj, labels, budget):
@@ -92,8 +108,8 @@ def run_epoch(model, classifier, loader, device, train, config, optim=None,
     total_loss, correct, total = 0.0, 0, 0
     use_amp = bool(config.use_amp and device.type == "cuda")
     for ids, adj, labels in loader:
-        ids = [t.to(device) for t in ids]
-        labels = labels.to(device)
+        ids = [t.to(device, non_blocking=True) for t in ids]
+        labels = labels.to(device, non_blocking=True)
         groups = _pack_by_node_budget(
             ids, adj, labels, getattr(config, "node_budget", 900))
         n_batch = labels.size(0)
@@ -152,12 +168,9 @@ def main():
             tokenizer=tokenizer, seq_len=config.seq_len,
         )
 
-    train_ds = make_dataset("train")
-    val_ds = make_dataset("val")
-    print(f"Task2-{args.platform}: train={len(train_ds)} val={len(val_ds)}")
-
     if args.eval:
         test_ds = make_dataset("test")
+        print(f"Task2-{args.platform}: test={len(test_ds)}")
         checkpoint = torch.load(
             os.path.join(config.checkpoint_save_path,
                          f"CFGFusion-task2-{args.platform}-best.pth"),
@@ -166,24 +179,32 @@ def main():
         model = CFGFusionModel(bert, d_model=config.d_model,
                                mpnn_readout_dim=config.mpnn_readout_dim,
                                cnn_out=config.cnn_out,
-                               hidden_dim=config.graph_hidden_dim).to(device)
+                               hidden_dim=config.graph_hidden_dim,
+                               checkpoint_node_threshold=(
+                                   config.checkpoint_node_threshold)).to(device)
         classifier = nn.Linear(config.graph_hidden_dim, config.num_classes).to(device)
         model.load_state_dict(checkpoint["model"])
         classifier.load_state_dict(checkpoint["classifier"])
-        test_loader = DataLoader(test_ds, batch_sampler=BucketBatchSampler(
+        test_loader = DataLoader(test_ds, batch_sampler=WorkloadBatchSampler(
                                     test_ds.graph_sizes(), config.batch_size,
-                                    shuffle=False, seed=config.seed),
-                                num_workers=config.num_workers,
-                                collate_fn=collate)
+                                    shuffle=False, seed=config.seed,
+                                    shapes=test_ds.graph_shapes()),
+                                **_loader_kwargs(config, device))
         loss, acc = run_epoch(model, classifier, test_loader, device, False, config)
         print(f"Task2-{args.platform} test: loss {loss:.4f} accuracy {acc:.4f}")
         return
+
+    train_ds = make_dataset("train")
+    val_ds = make_dataset("val")
+    print(f"Task2-{args.platform}: train={len(train_ds)} val={len(val_ds)}")
 
     bert = BERTForPretraining.from_pretrained(config.pretrained_path)
     model = CFGFusionModel(bert, d_model=config.d_model,
                            mpnn_readout_dim=config.mpnn_readout_dim,
                            cnn_out=config.cnn_out,
-                           hidden_dim=config.graph_hidden_dim).to(device)
+                           hidden_dim=config.graph_hidden_dim,
+                           checkpoint_node_threshold=(
+                               config.checkpoint_node_threshold)).to(device)
     classifier = nn.Linear(config.graph_hidden_dim, config.num_classes).to(device)
     print(f"Params: {sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in classifier.parameters()):,}")
 
@@ -200,20 +221,21 @@ def main():
     scaler = (torch.amp.GradScaler("cuda")
               if config.use_amp and device.type == "cuda" else None)
 
-    train_loader = DataLoader(train_ds, batch_sampler=BucketBatchSampler(
+    train_loader = DataLoader(train_ds, batch_sampler=WorkloadBatchSampler(
                                   train_ds.graph_sizes(), config.batch_size,
-                                  shuffle=True, seed=config.seed),
-                              num_workers=config.num_workers,
-                              collate_fn=collate)
-    val_loader = DataLoader(val_ds, batch_sampler=BucketBatchSampler(
+                                  shuffle=True, seed=config.seed,
+                                  shapes=train_ds.graph_shapes()),
+                              **_loader_kwargs(config, device))
+    val_loader = DataLoader(val_ds, batch_sampler=WorkloadBatchSampler(
                                 val_ds.graph_sizes(), config.batch_size,
-                                shuffle=False, seed=config.seed),
-                            num_workers=config.num_workers,
-                            collate_fn=collate)
+                                shuffle=False, seed=config.seed,
+                                shapes=val_ds.graph_shapes()),
+                            **_loader_kwargs(config, device))
 
     best_acc = -1.0
     os.makedirs(config.checkpoint_save_path, exist_ok=True)
     for epoch in range(config.epochs):
+        train_loader.batch_sampler.set_epoch(epoch)
         tr_loss, tr_acc = run_epoch(model, classifier, train_loader, device,
                                     True, config, optim, scaler)
         va_loss, va_acc = run_epoch(model, classifier, val_loader, device,

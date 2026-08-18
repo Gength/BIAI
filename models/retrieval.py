@@ -41,15 +41,36 @@ def build_retrieval_sets(anchor_keys, candidate_keys, opt_level=None):
     return retrieval, candidates
 
 
-def encode_keys(model, dataset, device, keys):
-    """Encode function keys one native-size CFG at a time."""
+def encode_keys(model, dataset, device, keys, node_budget=4000):
+    """Encode native-size CFGs in total-node-bounded BERT batches."""
     embeddings = []
+    pending_ids, pending_adj = [], []
+    pending_nodes = 0
+
+    def flush():
+        nonlocal pending_ids, pending_adj, pending_nodes
+        if not pending_ids:
+            return
+        with torch.inference_mode():
+            batch = model(
+                [ids.to(device, non_blocking=True) for ids in pending_ids],
+                pending_adj,
+            ).cpu()
+        embeddings.extend(batch.unbind(0))
+        pending_ids, pending_adj, pending_nodes = [], [], 0
+
     for key in keys:
         index = dataset.mapping[key]
         ids, adj = dataset.process_function(dataset.dataset[index])
-        with torch.no_grad():
-            embedding = model([ids.to(device)], [adj]).squeeze(0).cpu()
-        embeddings.append(embedding)
+        nodes = ids.size(0)
+        if pending_ids and pending_nodes + nodes > node_budget:
+            flush()
+        pending_ids.append(ids)
+        pending_adj.append(adj)
+        pending_nodes += nodes
+        if nodes >= node_budget:
+            flush()
+    flush()
     if not embeddings:
         raise RuntimeError("cannot encode an empty function pool")
     return torch.stack(embeddings, dim=0)
@@ -63,13 +84,18 @@ def evaluate_retrieval(model, dataset, device, anchor_keys, candidate_keys,
     if not retrieval:
         raise RuntimeError("no eligible cross-platform anchors were found")
     candidate_embeddings = encode_keys(model, dataset, device, candidates)
-    iterator = progress(retrieval) if progress is not None else retrieval
+    anchor_embeddings = encode_keys(
+        model, dataset, device, [anchor for anchor, _ in retrieval])
+    candidate_embeddings = F.normalize(candidate_embeddings, dim=1)
+    anchor_embeddings = F.normalize(anchor_embeddings, dim=1)
+    iterator = progress(range(len(retrieval))) if progress is not None \
+        else range(len(retrieval))
     reciprocal_ranks = []
     rank1 = []
-    for anchor, true_positions in iterator:
-        anchor_embedding = encode_keys(model, dataset, device, [anchor])
-        similarities = F.cosine_similarity(
-            anchor_embedding, candidate_embeddings, dim=1)
+    for index in iterator:
+        _, true_positions = retrieval[index]
+        similarities = torch.mv(
+            candidate_embeddings, anchor_embeddings[index])
         best_true_score = similarities[true_positions].max()
         rank = int((similarities > best_true_score).sum().item()) + 1
         reciprocal_ranks.append(1.0 / rank if rank <= 10 else 0.0)

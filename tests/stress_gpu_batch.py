@@ -45,10 +45,14 @@ def make_graph(nodes, seq_len, vocab_size, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--nodes", type=int, default=1000)
+    parser.add_argument("--target-nodes", type=int, default=None)
+    parser.add_argument("--pairs", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--vocab-size", type=int, default=967)
+    parser.add_argument("--checkpoint-threshold", type=int, default=1536)
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     args = parser.parse_args()
+    target_nodes = args.target_nodes or args.nodes
 
     if not torch.cuda.is_available():
         print("CUDA is not available", file=sys.stderr)
@@ -64,15 +68,21 @@ def main():
     bert = BERTForPretraining(config, num_gc_classes=8)
     model = CFGFusionModel(
         bert, d_model=128, mpnn_readout_dim=64, cnn_out=32,
-        hidden_dim=64).to(device).train()
+        hidden_dim=64,
+        checkpoint_node_threshold=args.checkpoint_threshold).to(device).train()
     if args.no_gradient_checkpointing:
+        model.adaptive_gradient_checkpointing = False
         model.bert.bert.gradient_checkpointing_disable()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     scaler = torch.amp.GradScaler("cuda")
-    anchor_ids, anchor_adj = make_graph(
+    anchors = [make_graph(
         args.nodes, args.seq_len, args.vocab_size, device)
-    target_ids, target_adj = make_graph(
-        args.nodes, args.seq_len, args.vocab_size, device)
+        for _ in range(args.pairs)]
+    targets = [make_graph(
+        target_nodes, args.seq_len, args.vocab_size, device)
+        for _ in range(args.pairs)]
+    anchor_ids, anchor_adj = map(list, zip(*anchors))
+    target_ids, target_adj = map(list, zip(*targets))
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
@@ -80,11 +90,15 @@ def main():
     optimizer.zero_grad(set_to_none=True)
     try:
         with torch.amp.autocast("cuda"):
-            anchor_embedding = model([anchor_ids], [anchor_adj])
-            target_embedding = model([target_ids], [target_adj])
+            # Match the fused siamese path used by the optimised trainer: the
+            # extreme pair is encoded by one total-node-bounded BERT launch.
+            embeddings = model(
+                anchor_ids + target_ids, anchor_adj + target_adj)
+            anchor_embedding = embeddings[:args.pairs]
+            target_embedding = embeddings[args.pairs:]
             loss = F.cosine_embedding_loss(
                 anchor_embedding, target_embedding,
-                torch.tensor([-1.0], device=device))
+                -torch.ones(args.pairs, device=device))
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -94,8 +108,11 @@ def main():
         print(json.dumps({
             "status": "oom",
             "nodes_per_graph": args.nodes,
+            "target_nodes_per_graph": target_nodes,
+            "pairs": args.pairs,
             "seq_len": args.seq_len,
             "allocator": os.environ["PYTORCH_CUDA_ALLOC_CONF"],
+            "checkpoint_node_threshold": args.checkpoint_threshold,
             "peak_allocated_gib": gib(torch.cuda.max_memory_allocated(device)),
             "peak_reserved_gib": gib(torch.cuda.max_memory_reserved(device)),
             "error": str(error),
@@ -106,10 +123,13 @@ def main():
     print(json.dumps({
         "status": "ok",
         "device": torch.cuda.get_device_name(device),
-        "nodes_per_graph": args.nodes,
-        "graphs_in_pair": 2,
+        "anchor_nodes_per_graph": args.nodes,
+        "target_nodes_per_graph": target_nodes,
+        "pairs": args.pairs,
+        "graphs_in_step": 2 * args.pairs,
         "seq_len": args.seq_len,
         "allocator": os.environ["PYTORCH_CUDA_ALLOC_CONF"],
+        "checkpoint_node_threshold": args.checkpoint_threshold,
         "gradient_checkpointing": model.bert.bert.is_gradient_checkpointing,
         "loss": float(loss.detach()),
         "total_memory_gib": gib(total_memory),

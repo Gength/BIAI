@@ -33,13 +33,15 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False uv run python tests/stress_gpu
 
 ## Architecture
 
-- `normalize_instr.py` — angr CFGFast 提取 CFG + 原始 token 策略；架构过滤 `['x64','arm64']`
+- `normalize_instr.py` — angr CFGFast 提取 CFG + 原始 token 策略；只接收 gcc+x64/arm64 的真实 ELF（排除 angr `*_angr_rtdb` sidecar）；`--force` 失败后按进度标记续跑
 - `split_dataset.py` — gcc+{x64,arm64}+{O0-O3} 筛选；从 Dataset-1 顶层目录恢复真实项目；按 `(project,function)` 做 80/10/10 隔离；Task1 按 `(binary target,function)` 配对；Task2 列表；train-only vocab
 - `models/tokenizer.py` — `AsmTokenizer(PreTrainedTokenizer)`：HF API + 汇编分词正则
 - `models/bert.py` — `build_bert_config`（`_attn_implementation="sdpa"`）+ `BERTForPretraining`（4 任务头，目录式 checkpoint）
-- `models/model.py` — `CFGFusionModel`：BERT [CLS] 块嵌入 → MPNN + OrderCNN → MLP；CFG 原生尺寸逐图 forward，禁止节点 padding/clipping
-- `models/trainer.py` — `BERTPretrainTrainer`（4 任务加权、每 5ep 存档）、`BERTFinetuneTrainer`（CosineEmbeddingLoss、有效 batch=10、node-budget、`BucketBatchSampler`）；`_resolve_device` 被入口复用
-- `models/retrieval.py` — Task1 验证/测试共用的全池真值构造、编码与 MRR10/Rank1；best checkpoint 按 validation MRR10 选择
+- `models/graph_dataset.py` — Task1/Task2 图数据快路径：预分配块 token 矩阵、稀疏邻接跨 PCIe；不改变 token/CFG 语义
+- `models/model.py` — `CFGFusionModel`：BERT [CLS] 块嵌入 → MPNN + OrderCNN → MLP；CFG 原生尺寸逐图头、禁止节点 padding/clipping；≤1536 总节点自适应关闭 BERT checkpoint，超出则开启
+- `models/trainer.py` — `BERTPretrainTrainer`（4 任务加权、每 5ep 存档）及 Task1 共用 loss/checkpoint 基类、`BucketBatchSampler`、`_resolve_device`
+- `models/finetune_trainer.py` — Task1 高吞吐执行：node-budget 内 anchor+target 合并 BERT、常驻 DataLoader workers；loss/有效 batch/逐图图头语义不变
+- `models/retrieval.py` — Task1 验证/测试共用的全池真值构造、node-budget 批量编码与 MRR10/Rank1；best checkpoint 按 validation MRR10 选择
 - `models/checkpoint_utils.py` — 新训练前自动备份已有 best，并清除旧完成标记
 - `bert4_*.py` / `bert_caculate_similarity.py` — 训练与唯一全池评估入口（Config 类承载超参）
 - `tests/test_regressions.py` / `tests/stress_gpu_*.py` — CPU 回归测试与 RTX 4080 极限 batch 显存测试
@@ -47,7 +49,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False uv run python tests/stress_gpu
 
 ## Conventions
 
-- 论文对齐超参：微调 Adam lr=1e-4、weight decay=0、有效 batch=10（Task1 batch=5 × grad_accum=2；Task2 batch=10）、T=5；预训练 batch=32、固定 lr；优化器统一 `torch.optim.Adam`
+- 论文对齐超参：微调 Adam lr=1e-4、weight decay=0、有效 batch=10（Task1/Task2 均为真实 batch=10）、T=5；预训练 batch=32、固定 lr；优化器统一 `torch.optim.Adam`
 - 预训练/Task2 使用完整 train split，不做人为 5%/30k 数据集抽样；每函数每预训练任务最多采样 16 个块/块对（论文要求随机采样若干块）
 - **可变尺寸图**：dataset/model 均不对节点 pad/clip；model 对 list 中每个 CFG 原生尺寸独立 forward；同一图的嵌入不得依赖 batch companion；token 序列仍按论文上限 pad/truncate 到 128
 - BERT 预训练 checkpoint 是目录（config.json + pytorch_model.bin）；Task1/Task2 checkpoint 是本地 `.pth` 权重文件；新训练自动备份已有 best；各阶段仅在成功结束后写 `train-done*.json`
@@ -57,6 +59,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False uv run python tests/stress_gpu
 - 显存/速度：SDPA；CUDA AMP+GradScaler；`BucketBatchSampler`；node budget=900（只拆 forward/backward，保持逻辑 batch loss/step）；Task1/Task2 的 BERT 开 gradient checkpointing，预训练关闭；微调启用 cuDNN benchmark
 - CUDA allocator 固定为 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`（`train.sh` 设置并由所有子进程继承）
 - RTX 4080 极限实测：Task1 1000+1000 节点、seq128、forward+backward+Adam，checkpoint 开启时 peak reserved 5.035 GiB；预训练 BIG 1024×128、无 checkpoint 时 6.988 GiB；Task1 全局关闭 checkpoint 不安全（512+512 已 7.527 GiB，1000+1000 超过 3.5 分钟未完成）
+- 高吞吐路径 RTX 4080 复测：4000-node 极限组（2 对 1000+1000）peak allocated 9.021 GiB / reserved 10.822 GiB；关闭 checkpoint 的阈值最坏形状 1000+536 peak 11.704/12.020 GiB；10×(32+32) 从逐图 14.37 提升至 59.24 pairs/s（4.12×），其中自适应 checkpoint 额外提升 16%
 - 预训练任务：MLM 为**单块**输入（论文 "token sequences inside the node"）；ANP/BIG/GC 输入**不做 mask**（论文 ANP 无 mask 描述）
 
 ## 已知限制
@@ -69,5 +72,5 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False uv run python tests/stress_gpu
 
 ## Notes
 
-- 2026-08-17 严格对齐修复完成；旧 `outputs/` 已清空。当前没有有效 checkpoint/指标；下一步执行 `bash train.sh`，它会从 `normalize --force` 开始全流程重建
+- 2026-08-17 严格对齐修复完成；旧 `outputs/` 已清空。normalize 已验收 1000/1000 个真实 ELF 对应的 baseline（sidecar 误识别故障已修复）；当前没有有效 checkpoint/指标，下一次 `bash train.sh` 会跳过 normalize 并从 split 继续
 - pipeline 以代码/数据/上游 checkpoint mtime + 完成标记判定新鲜度；任一依赖变化会自动使下游失效；Task1/Task2 评估结果统一写入 `outputs/results/task1-{o2,o3}.json` 与 `task2-{x64,arm64}.json`

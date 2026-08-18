@@ -12,8 +12,8 @@ from models.tokenizer import AsmTokenizer
 from models.bert import BERTForPretraining
 from models.checkpoint_utils import backup_existing, clear_completion_marker
 from models.model import CFGFusionModel
-from models.dataset import FunctionPairDataset
-from models.trainer import BERTFinetuneTrainer
+from models.graph_dataset import FunctionPairDataset
+from models.finetune_trainer import BERTFinetuneTrainer
 
 
 class Config:
@@ -32,10 +32,11 @@ class Config:
     mpnn_readout_dim = 64
     cnn_out = 32
     graph_hidden_dim = 64
+    checkpoint_node_threshold = 1536
 
     # --- training ---
-    batch_size = 5
-    grad_accum = 2            # effective batch = 10 (paper setting) via accumulation
+    batch_size = 10           # paper effective batch, now executed as one logical batch
+    grad_accum = 1
     epochs = 15
     lr = 1e-4                # paper: Adam, lr 1e-4
     weight_decay = 0.0         # paper specifies Adam, with no weight decay
@@ -43,7 +44,9 @@ class Config:
     margin = 0.0
     seed = 42
     num_workers = 2            # 2 workers 并行 tokenize（4 个会爆 15GB RAM）；内存 ~7GB 安全
-    prefetch_factor = 4
+    prefetch_factor = 2        # same queued sample count as the old 2x4x5 setup
+    node_budget = 4000         # up to two worst-case 1000+1000 pairs per launch
+    timing_interval = 200      # report loader wait vs GPU compute during long epochs
 
     # --- misc ---
     device = "cuda"          # falls back to CPU automatically
@@ -101,6 +104,7 @@ if __name__ == "__main__":
         mpnn_readout_dim=config.mpnn_readout_dim,
         cnn_out=config.cnn_out,
         hidden_dim=config.graph_hidden_dim,
+        checkpoint_node_threshold=config.checkpoint_node_threshold,
     )
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 

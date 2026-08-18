@@ -1,5 +1,6 @@
 import multiprocessing
 import argparse
+import hashlib
 import os
 import pickle
 import re
@@ -77,6 +78,61 @@ def normalize_instruction_assembly_code(instruction, arch_bits, Unknown=None):
     return normalized
 
 import angr
+
+
+def _is_elf_file(path):
+    """Return True only for regular ELF files (including symlinks to files)."""
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def discover_binary_paths(binary_folder, architecture, compiler):
+    """Discover the actual Dataset-1 binaries selected by this experiment."""
+    binary_paths = []
+    seen_binary_names = {}
+    for subfolder in sorted(os.listdir(binary_folder)):
+        subfolder_path = os.path.join(binary_folder, subfolder)
+        if not os.path.isdir(subfolder_path) or subfolder == "z3":
+            continue
+        for bin_name in sorted(os.listdir(subfolder_path)):
+            bin_path = os.path.join(subfolder_path, bin_name)
+            key_words = set(re.split("[-_]", bin_name))
+            selected = (bool(key_words & set(architecture))
+                        and bool(key_words & set(compiler)))
+            # angr may place directories such as ``*_angr_rtdb`` beside a
+            # binary. Filename matching alone must never treat those sidecars
+            # (or any other regular non-ELF file) as extraction targets.
+            if not selected or not _is_elf_file(bin_path):
+                continue
+            previous_project = seen_binary_names.get(bin_name)
+            if previous_project is not None and previous_project != subfolder:
+                raise ValueError(
+                    f"binary name {bin_name!r} occurs in both "
+                    f"{previous_project!r} and {subfolder!r}"
+                )
+            seen_binary_names[bin_name] = subfolder
+            binary_paths.append(bin_path)
+    return binary_paths
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_json_atomic(path, value):
+    temporary = path + ".tmp"
+    with open(temporary, "w") as f:
+        json.dump(value, f, indent=2)
+    os.replace(temporary, path)
 
 def disassemble_function(binary_path, function_address=None, function_name=None):
     """
@@ -247,51 +303,70 @@ if __name__ == "__main__":
     architecture = ['x64', 'arm64']  # paper Task 1: x86-64 <-> ARM
     compiler = ['gcc']
     tasks = []
+    selected_paths = discover_binary_paths(
+        binary_folder, architecture, compiler)
+    selected_names = [os.path.basename(path) for path in selected_paths]
+    extractor_sha256 = _file_sha256(__file__)
+    progress_path = os.path.join(save_root, "normalize-in-progress.json")
     run_started_ns = time.time_ns()
-    seen_binary_names = {}
-    for subfolder in os.listdir(binary_folder):
-        subfolder_path = os.path.join(binary_folder, subfolder)
-        if not os.path.isdir(subfolder_path):
-            continue
-        if subfolder == "z3":  # too large, excluded
-            continue
-        for bin_name in os.listdir(subfolder_path):
-            bin_path = os.path.join(subfolder_path, bin_name)
-            previous_project = seen_binary_names.get(bin_name)
-            if previous_project is not None and previous_project != subfolder:
-                raise ValueError(
-                    f"binary name {bin_name!r} occurs in both "
-                    f"{previous_project!r} and {subfolder!r}"
-                )
-            seen_binary_names[bin_name] = subfolder
-            if (not args.force and os.path.exists(
-                    os.path.join(save_root, "output_"+bin_name+".pkl"))):
-                continue
-            key_words = re.split('[-_]', bin_name)
-            intersection = len(set(key_words) & set(architecture)) > 0 and len(set(key_words) & set(compiler)) > 0
-            # Skip if the binary file name does not contain required keywords or architecture information
-            if intersection:
-                tasks.append((bin_path, save_root))
+    resumed_force = False
 
+    if args.force and os.path.exists(progress_path):
+        try:
+            with open(progress_path) as f:
+                progress = json.load(f)
+            if (progress.get("extractor_sha256") == extractor_sha256
+                    and progress.get("selected_binaries") == selected_names):
+                run_started_ns = int(progress["run_started_ns"])
+                resumed_force = True
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            resumed_force = False
 
+    if args.force and not resumed_force:
+        _write_json_atomic(progress_path, {
+            "run_started_ns": run_started_ns,
+            "extractor_sha256": extractor_sha256,
+            "selected_binaries": selected_names,
+        })
+
+    for bin_path in selected_paths:
+        output_path = os.path.join(
+            save_root, "output_" + os.path.basename(bin_path) + ".pkl")
+        output_is_current_force_run = (
+            os.path.exists(output_path)
+            and os.stat(output_path).st_mtime_ns >= run_started_ns
+        )
+        if ((not args.force and os.path.exists(output_path))
+                or (resumed_force and output_is_current_force_run)):
+            continue
+        tasks.append((bin_path, save_root))
+
+    if resumed_force:
+        print(f"Resuming forced extraction: {len(tasks)} of "
+              f"{len(selected_paths)} binaries remain.")
 
     # num_processes = min(multiprocessing.cpu_count(), len(tasks))
     num_processes = 6  # keep memory usage bounded (15GB host)
-    with multiprocessing.Pool(processes=num_processes) as pool:
-        unknown_list = list(tqdm(pool.imap_unordered(process_binary_file, tasks), total=len(tasks)))
-    # wait for all processes to finish
-    pool.close()
-    pool.join()
+    unknown_list = []
+    if tasks:
+        with multiprocessing.Pool(processes=num_processes) as pool:
+            unknown_list = list(tqdm(
+                pool.imap_unordered(process_binary_file, tasks),
+                total=len(tasks)))
     for unk in unknown_list:
         Unknown['unkown_opcode'].update(unk.get('unkown_opcode', set()))
         Unknown['unknown_reg'].update(unk.get('unknown_reg', set()))
         Unknown['unknown_operand'].update(unk.get('unknown_operand', set()))
     incomplete = []
-    for binary_path, destination in tasks:
+    processed_paths = {binary_path for binary_path, _ in tasks}
+    for binary_path in selected_paths:
         output_path = os.path.join(
-            destination, "output_" + os.path.basename(binary_path) + ".pkl")
+            save_root, "output_" + os.path.basename(binary_path) + ".pkl")
         if (not os.path.exists(output_path)
-                or os.stat(output_path).st_mtime_ns < run_started_ns):
+                or (binary_path in processed_paths
+                    and os.stat(output_path).st_mtime_ns < run_started_ns)
+                or (args.force
+                    and os.stat(output_path).st_mtime_ns < run_started_ns)):
             incomplete.append(binary_path)
     if incomplete:
         raise RuntimeError(
@@ -301,12 +376,17 @@ if __name__ == "__main__":
     Unknown['unkown_opcode'] = list(Unknown['unkown_opcode'])
     Unknown['unknown_reg'] = list(Unknown['unknown_reg'])
     Unknown['unknown_operand'] = list(Unknown['unknown_operand'])
-    with open(os.path.join(".", "unknown_opcode.json"), "w") as f:
-        # Merging Unknown information from all processes requires separate handling; here, only the main process's Unknown is saved
-        json.dump(Unknown, f, indent=4)
-    with open(os.path.join(save_root, "normalize-done.json"), "w") as f:
-        json.dump({
-            "processed_binaries": len(tasks),
-            "force": args.force,
-            "extractor_mtime_ns": os.stat(__file__).st_mtime_ns,
-        }, f, indent=2)
+    if tasks:
+        with open(os.path.join(save_root, "unknown_opcode.json"), "w") as f:
+            json.dump(Unknown, f, indent=4)
+    _write_json_atomic(os.path.join(save_root, "normalize-done.json"), {
+        "selected_binaries": len(selected_paths),
+        "processed_binaries": len(tasks),
+        "skipped_existing": len(selected_paths) - len(tasks),
+        "force": args.force,
+        "resumed_force": resumed_force,
+        "extractor_mtime_ns": os.stat(__file__).st_mtime_ns,
+        "extractor_sha256": extractor_sha256,
+    })
+    if os.path.exists(progress_path):
+        os.unlink(progress_path)

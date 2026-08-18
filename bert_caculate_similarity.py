@@ -16,7 +16,7 @@ from tqdm import tqdm
 from models.tokenizer import AsmTokenizer
 from models.bert import BERTForPretraining
 from models.model import CFGFusionModel
-from models.dataset import FunctionPairDataset
+from models.graph_dataset import FunctionPairDataset
 from models.retrieval import (
     build_retrieval_sets, encode_keys, evaluate_retrieval, load_function_keys,
 )
